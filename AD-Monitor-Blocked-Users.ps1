@@ -99,7 +99,8 @@ function Format-LockoutEvent {
     Write-Host "==================================================" -ForegroundColor Red
     Write-Host "👤 Usuário:        $TargetUserName" -ForegroundColor Cyan
     Write-Host "🕒 Data/Hora:      $TimeCreated" -ForegroundColor White
-    Write-Host "💻 Disp. de Origem: $($CallerComputer ? $CallerComputer : 'Desconhecido/Oculto')" -ForegroundColor Magenta
+    $DisplayComputer = if ([string]::IsNullOrWhiteSpace($CallerComputer) -or $CallerComputer -eq "-") { "Desconhecido/Oculto" } else { $CallerComputer }
+    Write-Host "💻 Disp. de Origem: $DisplayComputer" -ForegroundColor Magenta
     Write-Host "🌐 IP Resolvido:    $($Analysis.IP)" -ForegroundColor Magenta
     Write-Host "🔎 Diagnóstico:    $($Analysis.Suspeita)" -ForegroundColor Green
     Write-Host "--------------------------------------------------" -ForegroundColor Gray

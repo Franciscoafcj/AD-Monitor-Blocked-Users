@@ -3,10 +3,7 @@ if (-not (Get-Module -Name ActiveDirectory)) {
     Import-Module ActiveDirectory -ErrorAction Stop
 }
 
-$LogName = "Security"
-$EventID = 4740  # Evento de conta bloqueada no AD
 $DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name
-$RefreshInterval = 5  # Segundos entre verificações
 
 # cache simples para resolver nomes de máquina apenas uma vez
 $cacheDns = @{}
@@ -92,12 +89,12 @@ function Get-SourceAnalysis {
 # ============== FORMATAÇÃO DA SAÍDA ==============
 function Format-LockoutEvent {
     param(
-        $Event,
+        $evento,
         $TargetUserName,
         $CallerComputer
     )
     
-    $TimeCreated = $Event.TimeCreated
+    $TimeCreated = $evento.TimeCreated
     $Analysis = Get-SourceAnalysis -CallerComputer $CallerComputer
 
     Write-Host "`n==================================================" -ForegroundColor Red
@@ -148,7 +145,6 @@ function Start-ADLockoutMonitor {
     while ($true) {
         $cicloContagem++
         Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Ciclo #$cicloContagem - Verificando eventos..." -ForegroundColor Gray -NoNewline
-        $currentCheckTime = Get-Date
         
         # O ScriptBlock que será enviado e executado dentro de todos os DCs simultaneamente
         $ScriptBloco = {
@@ -212,7 +208,62 @@ function Start-ADLockoutMonitor {
                 }
             }
             catch {
-                Write-Host " ❌ (PSRemoting falhou - alternando para LOCAL)" -ForegroundColor Red
+                Write-Host " ❌" -ForegroundColor Red
+                Write-Host ""
+                Write-Host "⚠️  ERRO DE PSRemoting - Detalhes:" -ForegroundColor Red
+                
+                $errorMsg = $_.Exception.Message
+                $errorCode = $_.Exception.HResult
+                $errorType = $_.Exception.GetType().Name
+                $errorLine = $_.InvocationInfo.ScriptLineNumber
+                
+                Write-Host "   • Tipo de Erro: $errorType" -ForegroundColor Yellow
+                Write-Host "   • Código: 0x$($errorCode.ToString('X8'))" -ForegroundColor Yellow
+                Write-Host "   • Linha: $errorLine" -ForegroundColor Yellow
+                Write-Host "   • Mensagem: $errorMsg" -ForegroundColor Red
+                
+                # Análise detalhada do tipo de erro
+                if ($errorMsg -match "timeout|WinRM|timed out|TimeoutException") {
+                    Write-Host "   💡 Diagnóstico: Timeout na comunicação com DCs" -ForegroundColor Cyan
+                    Write-Host "   ✓ Soluções:" -ForegroundColor Green
+                    Write-Host "       1. Verificar conectividade com ADC (ping, telnet 5985)" -ForegroundColor Green
+                    Write-Host "       2. Aumentar timeout em Invoke-Command: -OperationTimeoutSec" -ForegroundColor Green
+                    Write-Host "       3. Verificar WinRM nos DCs: winrm get winrm/config" -ForegroundColor Green
+                }
+                elseif ($errorMsg -match "Access Denied|Acesso Negado|Unauthorized|permission") {
+                    Write-Host "   💡 Diagnóstico: Erro de autenticação ou permissão" -ForegroundColor Cyan
+                    Write-Host "   ✓ Soluções:" -ForegroundColor Green
+                    Write-Host "       1. Executar como Administrador de Domínio" -ForegroundColor Green
+                    Write-Host "       2. Verificar Trusted Hosts: Get-Item WSMan:\localhost\Client\TrustedHosts" -ForegroundColor Green
+                    Write-Host "       3. Adicionar DC aos Trusted Hosts se necessário" -ForegroundColor Green
+                }
+                elseif ($errorMsg -match "não está conectado|not connected|WinRM não está") {
+                    Write-Host "   💡 Diagnóstico: WinRM desabilitado ou não acessível" -ForegroundColor Cyan
+                    Write-Host "   ✓ Soluções:" -ForegroundColor Green
+                    Write-Host "       1. Habilitar PSRemoting no DC: Enable-PSRemoting -Force" -ForegroundColor Green
+                    Write-Host "       2. Verificar firewall: Get-NetFirewallRule -Name 'Windows Remote*'" -ForegroundColor Green
+                    Write-Host "       3. Reiniciar WinRM: Restart-Service WinRM" -ForegroundColor Green
+                }
+                elseif ($errorMsg -match "firewall|port|porta") {
+                    Write-Host "   💡 Diagnóstico: Possível bloqueio de firewall" -ForegroundColor Cyan
+                    Write-Host "   ✓ Soluções:" -ForegroundColor Green
+                    Write-Host "       1. Verificar regras de firewall (portas 5985/5986)" -ForegroundColor Green
+                    Write-Host "       2. Testar conectividade: Test-NetConnection -ComputerName DC -Port 5985" -ForegroundColor Green
+                    Write-Host "       3. Permitir tráfego WSMan no firewall" -ForegroundColor Green
+                }
+                elseif ($errorMsg -match "host|resolvido|DNS|não encontrado") {
+                    Write-Host "   💡 Diagnóstico: Erro de resolução DNS ou nome inválido" -ForegroundColor Cyan
+                    Write-Host "   ✓ Soluções:" -ForegroundColor Green
+                    Write-Host "       1. Validar nomes dos DCs: nslookup $($DCs[0])" -ForegroundColor Green
+                    Write-Host "       2. Verificar DNS local: Get-DnsClientServerAddress" -ForegroundColor Green
+                    Write-Host "       3. Usar FQDN ou IP do DC" -ForegroundColor Green
+                }
+                else {
+                    Write-Host "   💡 Diagnóstico: Erro não categorizado - verifique WinRM e conectividade" -ForegroundColor Cyan
+                }
+                
+                Write-Host ""
+                Write-Host "🔄 Alternando para modo LOCAL (apenas este servidor)..." -ForegroundColor Yellow
                 Write-Host ""
                 $UseRemote = $false  # Alterna para local
             }
@@ -274,16 +325,121 @@ function Test-PSRemotingAvailability {
     param([string[]]$ComputerNames)
     
     $disponivel = $true
+    $resultados = @()
+    
     foreach ($dc in $ComputerNames) {
         try {
+            Write-Host "  🔍 Testando PSRemoting em: $dc..." -ForegroundColor Cyan -NoNewline
             Test-WSMan -ComputerName $dc -ErrorAction Stop | Out-Null
+            Write-Host " ✅" -ForegroundColor Green
+            $resultados += @{ DC = $dc; Status = "OK"; Erro = $null }
         }
         catch {
-            Write-Host "❌ PSRemoting NÃO está habilitado em: $dc" -ForegroundColor Red
+            $errorMsg = $_.Exception.Message
+            $errorCode = $_.Exception.HResult
+            $errorType = $_.Exception.GetType().Name
+            
+            Write-Host " ❌" -ForegroundColor Red
+            Write-Host "     └─ Tipo: $errorType" -ForegroundColor Yellow
+            Write-Host "     └─ Código: 0x$($errorCode.ToString('X8'))" -ForegroundColor Yellow
+            Write-Host "     └─ Mensagem: $errorMsg" -ForegroundColor Yellow
+            
+            # Diagnóstico específico
+            if ($errorMsg -match "timeout|timed out|WinRM") {
+                Write-Host "     └─ 💡 Causa provável: Timeout de conexão ou WinRM desabilitado" -ForegroundColor DarkYellow
+            }
+            elseif ($errorMsg -match "Access Denied|Acesso Negado|Unauthorized") {
+                Write-Host "     └─ 💡 Causa provável: Credenciais insuficientes ou lista de confiança" -ForegroundColor DarkYellow
+            }
+            elseif ($errorMsg -match "not found|não resolvido|resolver") {
+                Write-Host "     └─ 💡 Causa provável: Nome do DC inválido ou problema de DNS" -ForegroundColor DarkYellow
+            }
+            elseif ($errorMsg -match "firewall|porta|port") {
+                Write-Host "     └─ 💡 Causa provável: Firewall bloqueando porta 5985/5986" -ForegroundColor DarkYellow
+            }
+            
+            $resultados += @{ DC = $dc; Status = "FALHA"; Erro = $errorMsg; ErrorCode = $errorCode; ErrorType = $errorType }
             $disponivel = $false
         }
     }
-    return $disponivel
+    
+    return @{ Disponivel = $disponivel; Detalhes = $resultados }
+}
+
+function Show-PSRemotingDiagnostics {
+    param([string[]]$ComputerNames)
+    
+    Clear-Host
+    Write-Host "╔═════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║              🔍 DIAGNÓSTICO COMPLETO DE PSRemoting              ║" -ForegroundColor Cyan
+    Write-Host "╚═════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    
+    Write-Host "1️⃣  Verificando WinRM localmente..." -ForegroundColor Yellow
+    try {
+        $winrmStatus = Get-Service -Name WinRM
+        Write-Host "   ✅ Serviço WinRM encontrado: $($winrmStatus.Status)" -ForegroundColor Green
+    } catch {
+        Write-Host "   ❌ WinRM não encontrado ou inacessível" -ForegroundColor Red
+    }
+    
+    Write-Host ""
+    Write-Host "2️⃣  Testando conectividade WSMan nos DCs..." -ForegroundColor Yellow
+    foreach ($dc in $ComputerNames) {
+        try {
+            $wsmanTest = Test-WSMan -ComputerName $dc -ErrorAction SilentlyContinue
+            if ($wsmanTest) {
+                Write-Host "   ✅ $dc - PSRemoting ATIVO" -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "   ❌ $dc - PSRemoting INATIVO ou INACESSÍVEL" -ForegroundColor Red
+            
+            # Tenta diagnóstico adicional
+            Write-Host "      🔧 Tentando diagnóstico avançado..." -ForegroundColor Gray
+            try {
+                $winrmConfig = Invoke-Command -ComputerName $dc -ScriptBlock { 
+                    Get-Service WinRM | Select-Object Status 
+                } -ErrorAction SilentlyContinue -OperationTimeoutSec 3
+                Write-Host "      └─ WinRM Status: $($winrmConfig.Status)" -ForegroundColor Yellow
+            } catch {
+                Write-Host "      └─ Não foi possível se conectar para diagnóstico" -ForegroundColor DarkRed
+            }
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "3️⃣  Verificando Trusted Hosts..." -ForegroundColor Yellow
+    try {
+        $trustedHosts = Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue
+        if ($trustedHosts.Value) {
+            Write-Host "   ✅ Trusted Hosts configurados: $($trustedHosts.Value)" -ForegroundColor Green
+        } else {
+            Write-Host "   ⚠️  Trusted Hosts vazio - aceita todos os hosts" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "   ⚠️  Erro ao ler Trusted Hosts" -ForegroundColor Yellow
+    }
+    
+    Write-Host ""
+    Write-Host "4️⃣  Testando portas WSMan (5985/5986)..." -ForegroundColor Yellow
+    foreach ($dc in $ComputerNames) {
+        $portaHttp = Test-NetConnection -ComputerName $dc -Port 5985 -InformationLevel Quiet -ErrorAction SilentlyContinue
+        $portaHttps = Test-NetConnection -ComputerName $dc -Port 5986 -InformationLevel Quiet -ErrorAction SilentlyContinue
+        
+        if ($portaHttp -or $portaHttps) {
+            Write-Host "   ✅ $dc - Portas acessíveis" -ForegroundColor Green
+        } else {
+            Write-Host "   ❌ $dc - Portas NÃO acessíveis (firewall pode estar bloqueando)" -ForegroundColor Red
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "5️⃣  Informações do Sistema Local..." -ForegroundColor Yellow
+    $osInfo = [System.Environment]::OSVersion
+    Write-Host "   • SO: $($osInfo.VersionString)" -ForegroundColor Gray
+    $psInfo = $PSVersionTable.PSVersion
+    Write-Host "   • PowerShell: $($psInfo.Major).$($psInfo.Minor)" -ForegroundColor Gray
+    Write-Host ""
 }
 
 function Show-PSRemotingInstructions {
@@ -309,12 +465,13 @@ function Show-PSRemotingInstructions {
     Write-Host ""
     Write-Host "─────────────────────────────────────────────────────────" -ForegroundColor Gray
     Write-Host "Opções disponíveis:" -ForegroundColor Yellow
-    Write-Host "1) Habilitar PSRemoting automaticamente AGORA (requer admin)" -ForegroundColor Cyan
-    Write-Host "2) Continuar com busca LOCAL apenas (sem acesso remoto aos DCs)" -ForegroundColor Cyan
-    Write-Host "3) Sair" -ForegroundColor Gray
+    Write-Host "1) Executar Diagnóstico Completo de PSRemoting" -ForegroundColor Cyan
+    Write-Host "2) Habilitar PSRemoting automaticamente AGORA (requer admin)" -ForegroundColor Cyan
+    Write-Host "3) Continuar com busca LOCAL apenas (sem acesso remoto aos DCs)" -ForegroundColor Cyan
+    Write-Host "4) Sair" -ForegroundColor Gray
     Write-Host ""
     
-    $opcao = Read-Host "Escolha (1, 2 ou 3)"
+    $opcao = Read-Host "Escolha (1, 2, 3 ou 4)"
     return $opcao
 }
 
@@ -327,9 +484,9 @@ function Enable-PSRemotingOnDCs {
     foreach ($dc in $ComputerNames) {
         try {
             Write-Host "  ⏳ Processando: $dc..." -ForegroundColor Yellow -NoNewline
-            $resultado = Invoke-Command -ComputerName $dc -ScriptBlock {
+            Invoke-Command -ComputerName $dc -ScriptBlock {
                 Enable-PSRemoting -Force -SkipNetworkProfileCheck
-            } -ErrorAction Stop
+            } -ErrorAction Stop | Out-Null
             Write-Host " ✅" -ForegroundColor Green
         }
         catch {
@@ -353,11 +510,29 @@ try {
     }
 
     # Verifica se PSRemoting está disponível
-    if (-not (Test-PSRemotingAvailability -ComputerNames $DCs)) {
+    Write-Host "🔐 Verificando disponibilidade de PSRemoting..." -ForegroundColor Cyan
+    $testRemoting = Test-PSRemotingAvailability -ComputerNames $DCs
+    
+    if (-not $testRemoting.Disponivel) {
+        Write-Host ""
+        Write-Host "Resumo de falhas:" -ForegroundColor Red
+        foreach ($resultado in $testRemoting.Detalhes | Where-Object { $_.Status -eq "FALHA" }) {
+            Write-Host "  • $($resultado.DC): $($resultado.Erro)" -ForegroundColor Yellow
+        }
+        Write-Host ""
+        
         $opcaoRemoting = Show-PSRemotingInstructions
         
         switch ($opcaoRemoting) {
             "1" {
+                Show-PSRemotingDiagnostics -ComputerNames $DCs
+                Write-Host ""
+                Write-Host "Pressione Enter para retornar ao menu..." -ForegroundColor Yellow
+                Read-Host | Out-Null
+                & $MyInvocation.MyCommand.Path  # Reinicia o script
+                return
+            }
+            "2" {
                 Write-Host ""
                 Write-Host "🔐 Você já deve estar em um DC ou ter conectividade remota." -ForegroundColor Yellow
                 Write-Host "   Tentando habilitar PSRemoting nos DCs..." -ForegroundColor Yellow
@@ -366,13 +541,13 @@ try {
                 & $MyInvocation.MyCommand.Path  # Reinicia o script
                 return
             }
-            "2" {
+            "3" {
                 Write-Host ""
                 Write-Host "⚠️  Continuando com busca LOCAL apenas." -ForegroundColor Yellow
                 Write-Host "   (Eventos remotos dos DCs NÃO serão capturados)" -ForegroundColor Yellow
                 Start-Sleep -Seconds 2
             }
-            "3" {
+            "4" {
                 Write-Host "Saindo..." -ForegroundColor Gray
                 exit
             }
@@ -384,7 +559,8 @@ try {
     }
 
     $choice = Get-MonitoringChoice
-    $useRemote = Test-PSRemotingAvailability -ComputerNames $DCs
+    $testRemotingFinal = Test-PSRemotingAvailability -ComputerNames $DCs
+    $useRemote = $testRemotingFinal.Disponivel
     Start-ADLockoutMonitor -MonitoringChoice $choice -UseRemote $useRemote
 }
 catch {

@@ -1,4 +1,8 @@
 ﻿# ============== CONFIGURAÇÕES INICIAIS ==============
+if (-not (Get-Module -Name ActiveDirectory)) {
+    Import-Module ActiveDirectory -ErrorAction Stop
+}
+
 $LogName = "Security"
 $EventID = 4740  # Evento de conta bloqueada no AD
 $DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name
@@ -8,7 +12,7 @@ $RefreshInterval = 5  # Segundos entre verificações
 function Get-MonitoringChoice {
     Clear-Host
     Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║       MONITOR DE BLOQUEIOS - ACTIVE DIRECTORY    ║" -ForegroundColor Cyan
+    Write-Host "║        MONITOR DE BLOQUEIOS - ACTIVE DIRECTORY   ║" -ForegroundColor Cyan
     Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
     Write-Host "║ Selecione o tipo de monitoramento:               ║" -ForegroundColor White
     Write-Host "║                                                  ║"
@@ -46,7 +50,6 @@ function Get-MonitoringChoice {
 function Get-SourceAnalysis {
     param([string]$CallerComputer)
 
-    # Se o computador de origem vier em branco
     if ([string]::IsNullOrWhiteSpace($CallerComputer) -or $CallerComputer -eq "-") {
         return @{
             IP = "N/A"
@@ -56,22 +59,20 @@ function Get-SourceAnalysis {
 
     $ip = "Não resolvido"
     try {
-        # Tenta resolver o IP do dispositivo de origem
         $dns = Resolve-DnsName -Name $CallerComputer -Type A -ErrorAction SilentlyContinue
         if ($dns) { $ip = $dns.IPAddress[0] }
     } catch {}
 
-    # Analisa o nome para sugerir a causa (Variações)
-    $suspeita = "Estação de Trabalho / Dispositivo Padrão. (Verifique Gerenciador de Credenciais do Windows ou Tarefas Agendadas neste IP)."
+    $suspeita = "Estação de Trabalho / Dispositivo Padrão. (Verifique Gerenciador de Credenciais ou Tarefas Agendadas)."
     
     if ($CallerComputer -match "(?i)EXCH|MAIL|OWA|WEB") {
-        $suspeita = "Servidor de E-mail/Web. 📱 Forte indício de celular com senha desatualizada tentando sincronizar e-mail."
+        $suspeita = "Servidor de E-mail/Web. 📱 Forte indício de celular com senha desatualizada."
     } elseif ($CallerComputer -match "(?i)DC0|AD0|SRV-AD") {
-        $suspeita = "Domain Controller. 🔄 O bloqueio ocorreu via autenticação direta no DC. Verifique Wi-Fi (NPS), VPN ou scripts de logon."
+        $suspeita = "Domain Controller. 🔄 Bloqueio via autenticação direta. Verifique Wi-Fi (NPS), VPN ou scripts."
     } elseif ($CallerComputer -match "(?i)VPN|FW|FIREWALL") {
-        $suspeita = "Gateway/VPN. 🌍 Tentativa de conexão externa com credencial salva ou ataque de força bruta externo."
+        $suspeita = "Gateway/VPN. 🌍 Tentativa de conexão externa ou ataque de força bruta."
     } elseif ($CallerComputer -match "(?i)FS|FILE|ARQUIVO") {
-        $suspeita = "File Server. 📁 Há um mapeamento de rede antigo usando as credenciais deste usuário."
+        $suspeita = "File Server. 📁 Há um mapeamento de rede antigo usando as credenciais."
     }
 
     return @{
@@ -82,18 +83,15 @@ function Get-SourceAnalysis {
 
 # ============== FORMATAÇÃO DA SAÍDA ==============
 function Format-LockoutEvent {
-    param($Event)
+    param(
+        $Event,
+        $TargetUserName,
+        $CallerComputer
+    )
     
     $TimeCreated = $Event.TimeCreated
-    
-    # Extração segura das propriedades do Evento 4740
-    $TargetUserName = $Event.Properties[0].Value
-    $CallerComputer = $Event.Properties[1].Value
-    
-    # Chama a função de análise de origem
     $Analysis = Get-SourceAnalysis -CallerComputer $CallerComputer
 
-    # Formatar saída colorida
     Write-Host "`n==================================================" -ForegroundColor Red
     Write-Host " 🚨 BLOQUEIO DETECTADO " -ForegroundColor Yellow -BackgroundColor DarkRed
     Write-Host "==================================================" -ForegroundColor Red
@@ -124,56 +122,86 @@ function Start-ADLockoutMonitor {
     
     Write-Host "Iniciando monitoramento em: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor White
     Write-Host "Servidores DC: $($DCs -join ', ')" -ForegroundColor Cyan
+    Write-Host "Motor de Busca: Paralelo (Alta Velocidade) ⚡" -ForegroundColor DarkYellow
     Write-Host "Pressione Ctrl+C para sair`n" -ForegroundColor Yellow
     
-    # Ajuste crítico: Começa a buscar eventos dos últimos 5 minutos, evitando ler o histórico inteiro do AD.
     $lastChecked = (Get-Date).AddMinutes(-5)
     $contadorEspecifico = 0
+    $processedEvents = [System.Collections.Generic.HashSet[string]]::new()
     
     while ($true) {
-        foreach ($DC in $DCs) {
-            try {
-                $events = Get-WinEvent -ComputerName $DC -FilterHashtable @{
-                    LogName = $LogName
-                    ID = $EventID
-                    StartTime = $lastChecked
-                } -ErrorAction SilentlyContinue
+        $currentCheckTime = Get-Date 
+        
+        # O ScriptBlock que será enviado e executado dentro de todos os DCs simultaneamente
+        $ScriptBloco = {
+            $threshold = $using:lastChecked
+            $eventos = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; ID = 4740 } -MaxEvents 50 -ErrorAction SilentlyContinue
+            
+            if ($eventos) {
+                # Filtra o tempo e faz a extração do XML DENTRO do servidor remoto (muito mais rápido)
+                $filtrados = $eventos | Where-Object { $_.TimeCreated -ge $threshold }
                 
-                if ($events) {
-                    # Inverte a ordem para mostrar os mais antigos primeiro (ordem cronológica)
-                    [array]::Reverse($events)
+                foreach ($evt in $filtrados) {
+                    $xml = [xml]$evt.ToXml()
+                    $dados = $xml.Event.EventData.Data
+                    
+                    # Retorna um objeto leve para a sua máquina
+                    [PSCustomObject]@{
+                        RecordId       = $evt.RecordId
+                        TimeCreated    = $evt.TimeCreated
+                        TargetUserName = ($dados | Where-Object Name -eq 'TargetUserName').'#text'
+                        CallerComputer = ($dados | Where-Object Name -eq 'CallerComputer').'#text'
+                        OrigemDC       = $env:COMPUTERNAME
+                    }
+                }
+            }
+        }
 
-                    foreach ($event in $events) {
-                        $userName = $event.Properties[0].Value
+        try {
+            # Executa o bloco de código em TODOS os DCs ao mesmo tempo usando PSRemoting
+            $resultados = Invoke-Command -ComputerName $DCs -ScriptBlock $ScriptBloco -ErrorAction SilentlyContinue
+            
+            if ($resultados) {
+                # Ordena todos os eventos de todos os DCs cronologicamente
+                $resultadosOrdenados = $resultados | Sort-Object TimeCreated
+                
+                foreach ($evento in $resultadosOrdenados) {
+                    $uniqueEventId = "$($evento.OrigemDC)-$($evento.RecordId)"
+                    
+                    if ($processedEvents.Add($uniqueEventId)) {
+                        $userName = $evento.TargetUserName
+                        $callerComputer = $evento.CallerComputer
+                        $dcNome = $evento.OrigemDC
                         
                         if ($MonitorEspecifico) {
-                            if ($userName -eq $UsuarioAlvo) {
+                            if ($userName -match $UsuarioAlvo) {
                                 $contadorEspecifico++
-                                Write-Host "[OCORRÊNCIA #$contadorEspecifico PARA $UsuarioAlvo]" -ForegroundColor DarkYellow
-                                Format-LockoutEvent -Event $event
+                                Write-Host "`n[OCORRÊNCIA #$contadorEspecifico PARA $UsuarioAlvo NO DC $dcNome]" -ForegroundColor DarkYellow
+                                Format-LockoutEvent -Event $evento -TargetUserName $userName -CallerComputer $callerComputer
                             }
                         } else {
-                            Format-LockoutEvent -Event $event
+                            Write-Host "`n[OCORRÊNCIA REGISTRADA NO DC $dcNome]" -ForegroundColor DarkGray
+                            Format-LockoutEvent -Event $evento -TargetUserName $userName -CallerComputer $callerComputer
                         }
                     }
                 }
             }
-            catch {
-                Write-Host "[$DC] Falha ao consultar: $($_.Exception.Message)" -ForegroundColor DarkRed
-            }
+        }
+        catch {
+            # Ignora erros de rede momentâneos na thread paralela
         }
         
-        $lastChecked = Get-Date
+        $lastChecked = $currentCheckTime
         Start-Sleep -Seconds $RefreshInterval
     }
 }
 
 # ============== EXECUÇÃO PRINCIPAL ==============
 try {
-    # Necessário rodar como Administrador para consultar logs remotos
-    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host "Aviso: Recomenda-se rodar este script como Administrador para ter permissão de ler os logs dos DCs." -ForegroundColor Yellow
-        Start-Sleep -Seconds 2
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Host "Aviso: Recomenda-se fortemente rodar este script como Administrador para ter permissão de ler logs remotos." -ForegroundColor Yellow
+        Start-Sleep -Seconds 3
     }
 
     $choice = Get-MonitoringChoice
@@ -181,6 +209,6 @@ try {
 }
 catch {
     Write-Host "Erro crítico: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Pressione qualquer tecla para sair..." -ForegroundColor Yellow
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    Write-Host "Pressione Enter para sair..." -ForegroundColor Yellow
+    Read-Host
 }

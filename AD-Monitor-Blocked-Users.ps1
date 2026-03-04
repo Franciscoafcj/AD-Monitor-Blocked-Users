@@ -19,10 +19,10 @@ function Get-MonitoringChoice {
     Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
     Write-Host "║ Selecione o tipo de monitoramento:               ║" -ForegroundColor White
     Write-Host "║                                                  ║"
-    Write-Host "║ 1) Monitorar TODOS os usuários                 ║" -ForegroundColor Yellow
-    Write-Host "║ 2) Monitorar um USUÁRIO ESPECÍFICO             ║" -ForegroundColor Green
+    Write-Host "║ 1) Monitorar TODOS os usuários                   ║" -ForegroundColor Yellow
+    Write-Host "║ 2) Monitorar um USUÁRIO ESPECÍFICO               ║" -ForegroundColor Green
     Write-Host "║                                                  ║"
-    Write-Host "║ Pressione 1 ou 2...                            ║" -ForegroundColor White
+    Write-Host "║ Pressione 1 ou 2...                              ║" -ForegroundColor White
     Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
     
@@ -114,7 +114,7 @@ function Format-LockoutEvent {
 
 # ============== MONITORAMENTO ==============
 function Start-ADLockoutMonitor {
-    param($MonitoringChoice)
+    param($MonitoringChoice, [bool]$UseRemote = $true)
     
     $MonitorEspecifico = ($MonitoringChoice.Tipo -eq "Especifico")
     $UsuarioAlvo = $MonitoringChoice.Usuario
@@ -129,16 +129,26 @@ function Start-ADLockoutMonitor {
     }
     
     Write-Host "Iniciando monitoramento em: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor White
-    Write-Host "Servidores DC: $($DCs -join ', ')" -ForegroundColor Cyan
+    if ($UseRemote) {
+        Write-Host "Servidores DC: $($DCs -join ', ')" -ForegroundColor Cyan
+        Write-Host "Modo: Remoto (PSRemoting) 🌐" -ForegroundColor Cyan
+    } else {
+        Write-Host "Modo: Local (Este servidor apenas) 🖥️" -ForegroundColor Yellow
+    }
     Write-Host "Motor de Busca: Paralelo (Alta Velocidade) ⚡" -ForegroundColor DarkYellow
     Write-Host "Pressione Ctrl+C para sair`n" -ForegroundColor Yellow
+    Write-Host "✅ Monitoramento ativo - aguardando bloqueios..." -ForegroundColor Green
+    Write-Host "" 
     
     $lastChecked = (Get-Date).AddMinutes(-5)
     $contadorEspecifico = 0
     $processedEvents = [System.Collections.Generic.HashSet[string]]::new()
+    $cicloContagem = 0
     
     while ($true) {
-        $currentCheckTime = Get-Date 
+        $cicloContagem++
+        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Ciclo #$cicloContagem - Verificando eventos..." -ForegroundColor Gray -NoNewline
+        $currentCheckTime = Get-Date
         
         # O ScriptBlock que será enviado e executado dentro de todos os DCs simultaneamente
         $ScriptBloco = {
@@ -151,72 +161,235 @@ function Start-ADLockoutMonitor {
 
                 if ($eventos) {
                     foreach ($evt in $eventos) {
-                        # extrai diretamente das propriedades; evita o parsing XML pesado
-                        $target = ($evt.Properties | Where-Object { $_.Name -eq 'TargetUserName' }).Value
-                        $caller = ($evt.Properties | Where-Object { $_.Name -eq 'CallerComputer' }).Value
+                        # Extrai dados do evento - Properties é um array, ordem pode variar
+                        $props = @{}
+                        for ($i = 0; $i -lt $evt.Properties.Count; $i++) {
+                            # Índices fixos para evento 4740: TargetUserName (0), TargetDomainName (1), TargetSid (2), CallerComputer (3)
+                            if ($i -eq 0) { $props['TargetUserName'] = $evt.Properties[$i].Value }
+                            if ($i -eq 3) { $props['CallerComputer'] = $evt.Properties[$i].Value }
+                        }
 
                         [PSCustomObject]@{
                             RecordId       = $evt.RecordId
                             TimeCreated    = $evt.TimeCreated
-                            TargetUserName = $target
-                            CallerComputer = $caller
+                            TargetUserName = $props['TargetUserName']
+                            CallerComputer = $props['CallerComputer']
                             OrigemDC       = $env:COMPUTERNAME
                         }
                     }
                 }
             }
-        try {
-            # Executa o bloco de código em TODOS os DCs ao mesmo tempo usando PSRemoting
-            $resultados = Invoke-Command -ComputerName $DCs -ScriptBlock $ScriptBloco -ErrorAction SilentlyContinue
-            
-            if ($resultados) {
-                # Ordena todos os eventos de todos os DCs cronologicamente
-                $resultadosOrdenados = $resultados | Sort-Object TimeCreated
+        
+        if ($UseRemote) {
+            try {
+                # Executa o bloco de código em TODOS os DCs ao mesmo tempo usando PSRemoting
+                $resultados = Invoke-Command -ComputerName $DCs -ScriptBlock $ScriptBloco -ErrorAction Stop
                 
-                foreach ($evento in $resultadosOrdenados) {
-                    $uniqueEventId = "$($evento.OrigemDC)-$($evento.RecordId)"
+                if ($resultados) {
+                    # Ordena todos os eventos de todos os DCs cronologicamente
+                    $resultadosOrdenados = $resultados | Sort-Object TimeCreated
                     
-                    if ($processedEvents.Add($uniqueEventId)) {
-                        $userName = $evento.TargetUserName
-                        $callerComputer = $evento.CallerComputer
-                        $dcNome = $evento.OrigemDC
+                    foreach ($evento in $resultadosOrdenados) {
+                        $uniqueEventId = "$($evento.OrigemDC)-$($evento.RecordId)"
                         
-                        if ($MonitorEspecifico) {
-                            if ($userName -ieq $UsuarioAlvo) {
-                                $contadorEspecifico++
-                                Write-Host "`n[OCORRÊNCIA #$contadorEspecifico PARA $UsuarioAlvo NO DC $dcNome]" -ForegroundColor DarkYellow
+                        if ($processedEvents.Add($uniqueEventId)) {
+                            $userName = $evento.TargetUserName
+                            $callerComputer = $evento.CallerComputer
+                            $dcNome = $evento.OrigemDC
+                            
+                            if ($MonitorEspecifico) {
+                                if ($userName -ieq $UsuarioAlvo) {
+                                    $contadorEspecifico++
+                                    Write-Host "`n[OCORRÊNCIA #$contadorEspecifico PARA $UsuarioAlvo NO DC $dcNome]" -ForegroundColor DarkYellow
+                                    Format-LockoutEvent -Event $evento -TargetUserName $userName -CallerComputer $callerComputer
+                                }
+                            } else {
+                                Write-Host "`n[OCORRÊNCIA REGISTRADA NO DC $dcNome]" -ForegroundColor DarkGray
                                 Format-LockoutEvent -Event $evento -TargetUserName $userName -CallerComputer $callerComputer
                             }
-                        } else {
-                            Write-Host "`n[OCORRÊNCIA REGISTRADA NO DC $dcNome]" -ForegroundColor DarkGray
-                            Format-LockoutEvent -Event $evento -TargetUserName $userName -CallerComputer $callerComputer
                         }
                     }
                 }
             }
-        }
-        catch {
-            # Ignora erros de rede momentâneos na thread paralela
+            catch {
+                Write-Host " ❌ (PSRemoting falhou - alternando para LOCAL)" -ForegroundColor Red
+                Write-Host ""
+                $UseRemote = $false  # Alterna para local
+            }
         }
         
-        $lastChecked = $currentCheckTime
-        Start-Sleep -Seconds $RefreshInterval
+        if (-not $UseRemote) {
+            # Busca LOCAL
+            try {
+                $eventos = Get-WinEvent -FilterHashtable @{ 
+                    LogName   = 'Security'
+                    ID        = 4740
+                    StartTime = $lastChecked
+                } -ErrorAction SilentlyContinue
+                
+                if ($eventos) {
+                    foreach ($evt in $eventos) {
+                        $props = @{}
+                        for ($i = 0; $i -lt $evt.Properties.Count; $i++) {
+                            if ($i -eq 0) { $props['TargetUserName'] = $evt.Properties[$i].Value }
+                            if ($i -eq 3) { $props['CallerComputer'] = $evt.Properties[$i].Value }
+                        }
+                        
+                        $uniqueEventId = "LOCAL-$($evt.RecordId)"
+                        if ($processedEvents.Add($uniqueEventId)) {
+                            $userName = $props['TargetUserName']
+                            $callerComputer = $props['CallerComputer']
+                            
+                            if ($MonitorEspecifico) {
+                                if ($userName -ieq $UsuarioAlvo) {
+                                    $contadorEspecifico++
+                                    Write-Host "`n[OCORRÊNCIA #$contadorEspecifico PARA $UsuarioAlvo]" -ForegroundColor DarkYellow
+                                    Format-LockoutEvent -Event $evt -TargetUserName $userName -CallerComputer $callerComputer
+                                }
+                            } else {
+                                Write-Host "`n[OCORRÊNCIA REGISTRADA]" -ForegroundColor DarkGray
+                                Format-LockoutEvent -Event $evt -TargetUserName $userName -CallerComputer $callerComputer
+                            }
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Host " ❌" -ForegroundColor Red
+                Write-Host "Erro ao buscar eventos: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+        
+        if ($UseRemote) {
+            Write-Host " ✅" -ForegroundColor Green
+        } elseif ($cicloContagem -eq 1) {
+            Write-Host ""  # Quebra de linha já feita acima no modo local
+        }
+        
     }
+}
+
+# ============== VERIFICAÇÃO DE PRÉ-REQUISITOS ==============
+function Test-PSRemotingAvailability {
+    param([string[]]$ComputerNames)
+    
+    $disponivel = $true
+    foreach ($dc in $ComputerNames) {
+        try {
+            Test-WSMan -ComputerName $dc -ErrorAction Stop | Out-Null
+        }
+        catch {
+            Write-Host "❌ PSRemoting NÃO está habilitado em: $dc" -ForegroundColor Red
+            $disponivel = $false
+        }
+    }
+    return $disponivel
+}
+
+function Show-PSRemotingInstructions {
+    Clear-Host
+    Write-Host "╔═══════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+    Write-Host "║         ⚠️  PSRemoting NÃO HABILITADO NOS DOMAIN CONTROLLERS   ║" -ForegroundColor Red
+    Write-Host "╚═══════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Para usar este script COM conexão remota aos DCs, execute:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  📝 EM CADA DOMAIN CONTROLLER (como Administrador):" -ForegroundColor Cyan
+    Write-Host "  " -ForegroundColor Green
+    Write-Host "  Enable-PSRemoting -Force -SkipNetworkProfileCheck" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  🔄 OU REMOTAMENTE (de um DC para todos os outros):" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  `$DCs = @('SSOOAD01', 'SSOOAD02')  # Altere conforme necessário" -ForegroundColor Green
+    Write-Host "  `$DCs | ForEach-Object {" -ForegroundColor Green
+    Write-Host "      Invoke-Command -ComputerName `$_ -ScriptBlock {" -ForegroundColor Green
+    Write-Host "          Enable-PSRemoting -Force -SkipNetworkProfileCheck" -ForegroundColor Green
+    Write-Host "      }" -ForegroundColor Green
+    Write-Host "  }" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "─────────────────────────────────────────────────────────" -ForegroundColor Gray
+    Write-Host "Opções disponíveis:" -ForegroundColor Yellow
+    Write-Host "1) Habilitar PSRemoting automaticamente AGORA (requer admin)" -ForegroundColor Cyan
+    Write-Host "2) Continuar com busca LOCAL apenas (sem acesso remoto aos DCs)" -ForegroundColor Cyan
+    Write-Host "3) Sair" -ForegroundColor Gray
+    Write-Host ""
+    
+    $opcao = Read-Host "Escolha (1, 2 ou 3)"
+    return $opcao
+}
+
+function Enable-PSRemotingOnDCs {
+    param([string[]]$ComputerNames)
+    
+    Write-Host ""
+    Write-Host "🔄 Habilitando PSRemoting nos DCs..." -ForegroundColor Green
+    
+    foreach ($dc in $ComputerNames) {
+        try {
+            Write-Host "  ⏳ Processando: $dc..." -ForegroundColor Yellow -NoNewline
+            $resultado = Invoke-Command -ComputerName $dc -ScriptBlock {
+                Enable-PSRemoting -Force -SkipNetworkProfileCheck
+            } -ErrorAction Stop
+            Write-Host " ✅" -ForegroundColor Green
+        }
+        catch {
+            Write-Host " ❌ Falha: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "✅ Processo concluído! Reiniciando..." -ForegroundColor Green
+    Start-Sleep -Seconds 2
 }
 
 # ============== EXECUÇÃO PRINCIPAL ==============
 try {
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
-        Write-Host "Aviso: Recomenda-se fortemente rodar este script como Administrador para ter permissão de ler logs remotos." -ForegroundColor Yellow
-        Start-Sleep -Seconds 3
+        Write-Host "⚠️  Este script requer privilégios de ADMINISTRADOR." -ForegroundColor Yellow
+        Write-Host "    Reinicie o PowerShell como Administrador." -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
+        exit
+    }
+
+    # Verifica se PSRemoting está disponível
+    if (-not (Test-PSRemotingAvailability -ComputerNames $DCs)) {
+        $opcaoRemoting = Show-PSRemotingInstructions
+        
+        switch ($opcaoRemoting) {
+            "1" {
+                Write-Host ""
+                Write-Host "🔐 Você já deve estar em um DC ou ter conectividade remota." -ForegroundColor Yellow
+                Write-Host "   Tentando habilitar PSRemoting nos DCs..." -ForegroundColor Yellow
+                Write-Host ""
+                Enable-PSRemotingOnDCs -ComputerNames $DCs
+                & $MyInvocation.MyCommand.Path  # Reinicia o script
+                return
+            }
+            "2" {
+                Write-Host ""
+                Write-Host "⚠️  Continuando com busca LOCAL apenas." -ForegroundColor Yellow
+                Write-Host "   (Eventos remotos dos DCs NÃO serão capturados)" -ForegroundColor Yellow
+                Start-Sleep -Seconds 2
+            }
+            "3" {
+                Write-Host "Saindo..." -ForegroundColor Gray
+                exit
+            }
+            default {
+                Write-Host "Opção inválida. Saindo..." -ForegroundColor Red
+                exit
+            }
+        }
     }
 
     $choice = Get-MonitoringChoice
-    Start-ADLockoutMonitor -MonitoringChoice $choice
+    $useRemote = Test-PSRemotingAvailability -ComputerNames $DCs
+    Start-ADLockoutMonitor -MonitoringChoice $choice -UseRemote $useRemote
 }
 catch {
     Write-Host "Erro crítico: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Stack: $($_.ScriptStackTrace)" -ForegroundColor DarkRed
     Write-Host "Pressione Enter para sair..." -ForegroundColor Yellow
     Read-Host
 }

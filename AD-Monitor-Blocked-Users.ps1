@@ -8,6 +8,9 @@ $EventID = 4740  # Evento de conta bloqueada no AD
 $DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name
 $RefreshInterval = 5  # Segundos entre verificações
 
+# cache simples para resolver nomes de máquina apenas uma vez
+$cacheDns = @{}
+
 # ============== ESCOLHA DE MONITORAMENTO ==============
 function Get-MonitoringChoice {
     Clear-Host
@@ -57,11 +60,16 @@ function Get-SourceAnalysis {
         }
     }
 
-    $ip = "Não resolvido"
-    try {
-        $dns = Resolve-DnsName -Name $CallerComputer -Type A -ErrorAction SilentlyContinue
-        if ($dns) { $ip = $dns.IPAddress[0] }
-    } catch {}
+    # usa cache simples para não resolver o mesmo nome repetidas vezes
+    if (-not $cacheDns.ContainsKey($CallerComputer)) {
+        try {
+            $cacheDns[$CallerComputer] = (Resolve-DnsName -Name $CallerComputer -Type A -ErrorAction SilentlyContinue).IPAddress[0]
+        } catch {
+            $cacheDns[$CallerComputer] = $null
+        }
+    }
+
+    $ip = $cacheDns[$CallerComputer] ? $cacheDns[$CallerComputer] : "Não resolvido"
 
     $suspeita = "Estação de Trabalho / Dispositivo Padrão. (Verifique Gerenciador de Credenciais ou Tarefas Agendadas)."
     
@@ -134,29 +142,29 @@ function Start-ADLockoutMonitor {
         
         # O ScriptBlock que será enviado e executado dentro de todos os DCs simultaneamente
         $ScriptBloco = {
-            $threshold = $using:lastChecked
-            $eventos = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; ID = 4740 } -MaxEvents 50 -ErrorAction SilentlyContinue
-            
-            if ($eventos) {
-                # Filtra o tempo e faz a extração do XML DENTRO do servidor remoto (muito mais rápido)
-                $filtrados = $eventos | Where-Object { $_.TimeCreated -ge $threshold }
-                
-                foreach ($evt in $filtrados) {
-                    $xml = [xml]$evt.ToXml()
-                    $dados = $xml.Event.EventData.Data
-                    
-                    # Retorna um objeto leve para a sua máquina
-                    [PSCustomObject]@{
-                        RecordId       = $evt.RecordId
-                        TimeCreated    = $evt.TimeCreated
-                        TargetUserName = ($dados | Where-Object Name -eq 'TargetUserName').'#text'
-                        CallerComputer = ($dados | Where-Object Name -eq 'CallerComputer').'#text'
-                        OrigemDC       = $env:COMPUTERNAME
+                $threshold = $using:lastChecked
+                $eventos = Get-WinEvent -FilterHashtable @{ 
+                    LogName   = 'Security'
+                    ID        = 4740
+                    StartTime = $threshold
+                } -ErrorAction SilentlyContinue
+
+                if ($eventos) {
+                    foreach ($evt in $eventos) {
+                        # extrai diretamente das propriedades; evita o parsing XML pesado
+                        $target = ($evt.Properties | Where-Object { $_.Name -eq 'TargetUserName' }).Value
+                        $caller = ($evt.Properties | Where-Object { $_.Name -eq 'CallerComputer' }).Value
+
+                        [PSCustomObject]@{
+                            RecordId       = $evt.RecordId
+                            TimeCreated    = $evt.TimeCreated
+                            TargetUserName = $target
+                            CallerComputer = $caller
+                            OrigemDC       = $env:COMPUTERNAME
+                        }
                     }
                 }
             }
-        }
-
         try {
             # Executa o bloco de código em TODOS os DCs ao mesmo tempo usando PSRemoting
             $resultados = Invoke-Command -ComputerName $DCs -ScriptBlock $ScriptBloco -ErrorAction SilentlyContinue
@@ -174,7 +182,7 @@ function Start-ADLockoutMonitor {
                         $dcNome = $evento.OrigemDC
                         
                         if ($MonitorEspecifico) {
-                            if ($userName -match $UsuarioAlvo) {
+                            if ($userName -ieq $UsuarioAlvo) {
                                 $contadorEspecifico++
                                 Write-Host "`n[OCORRÊNCIA #$contadorEspecifico PARA $UsuarioAlvo NO DC $dcNome]" -ForegroundColor DarkYellow
                                 Format-LockoutEvent -Event $evento -TargetUserName $userName -CallerComputer $callerComputer

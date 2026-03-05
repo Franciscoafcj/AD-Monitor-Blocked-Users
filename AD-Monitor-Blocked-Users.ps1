@@ -66,7 +66,7 @@ function Get-SourceAnalysis {
         }
     }
 
-    $ip = $cacheDns[$CallerComputer] ? $cacheDns[$CallerComputer] : "Não resolvido"
+    $ip = if ($cacheDns[$CallerComputer]) { $cacheDns[$CallerComputer] } else { "Não resolvido" }
 
     $suspeita = "Estação de Trabalho / Dispositivo Padrão. (Verifique Gerenciador de Credenciais ou Tarefas Agendadas)."
     

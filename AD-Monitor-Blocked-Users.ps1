@@ -4,7 +4,6 @@ if (-not (Get-Module -Name ActiveDirectory)) {
 }
 
 $DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name
-
 # cache simples para resolver nomes de máquina apenas uma vez
 $cacheDns = @{}
 
@@ -136,7 +135,7 @@ function Start-ADLockoutMonitor {
     Write-Host "✅ Monitoramento ativo - aguardando bloqueios..." -ForegroundColor Green
     Write-Host "" 
     
-    $lastChecked = (Get-Date).AddMinutes(-5)
+    $lastChecked = (Get-Date).AddDays(-7) # busca eventos dos últimos 7 dias no primeiro ciclo, depois só os novos
     $contadorEspecifico = 0
     $processedEvents = [System.Collections.Generic.HashSet[string]]::new()
     $cicloContagem = 0

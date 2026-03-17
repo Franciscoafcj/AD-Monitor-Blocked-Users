@@ -388,7 +388,3 @@ Localize a linha `Start-Sleep -Seconds 10` dentro da função `Start-ADLockoutMo
 Localize `if ($ciclo % 30 -eq 0)` e altere o divisor. Ex.: `% 10` exibe o painel a cada 10 ciclos (~100 segundos).
 
 ---
-
-## 📄 Licença
-
-MIT — consulte o arquivo [LICENSE](LICENSE) para detalhes.

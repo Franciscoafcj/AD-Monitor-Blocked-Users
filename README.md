@@ -1,356 +1,390 @@
-# 🔐 AD Monitor Blocked Users
-
-**Ferramenta avançada de monitoramento em tempo real de bloqueios de conta no Active Directory**
-
-## 📋 Descrição
-
-Este script PowerShell monitora continuamente os **bloqueios de conta de usuários** no Active Directory (AD), fornecendo informações detalhadas sobre:
-
-- ✅ Qual usuário foi bloqueado
-- 🕒 Quando ocorreu o bloqueio
-- 💻 De qual dispositivo/máquina o bloqueio originou
-- 🌐 IP da máquina de origem (resolvido automaticamente)
-- 🔍 Diagnóstico inteligente sobre a origem do bloqueio
-
-## 🚀 Características Principais
-
-### Monitoramento Flexível
-- **Modo Todos**: Monitora bloqueios de todos os usuários do AD
-- **Modo Específico**: Foca em monitorar um usuário específico
-
-### Diagnóstico Inteligente
-O script analisa automaticamente o nome da máquina de origem e identifica:
-- 📱 Servidores de e-mail (indicativos de celulares com senha desatualizada)
-- 🔄 Domain Controllers
-- 🌍 Gateways/VPN
-- 📁 File Servers
-- 💻 Estações de trabalho padrão
-
-### Execução Remota
-- 🌐 Conecta-se a **todos os Domain Controllers em paralelo** via PSRemoting
-- ⚡ Busca distribuída de alta velocidade
-- 🔄 Cache de DNS para otimização
-
-### Cache Inteligente
-- Armazena em cache resoluções de DNS para evitar consultas repetidas
-- Rastreia eventos já processados para evitar duplicatas
-
-## 📋 Pré-requisitos
-
-### Sistema
-- **Windows Server** com PowerShell 5.0 ou superior
-- Acesso ao **Active Directory** (módulo ActiveDirectory instalado)
-- Privilégios de **Administrador Local**
-- Privilégios de **Administrador de Domínio** (recomendado)
-
-### Módulos PowerShell Obrigatórios
-```powershell
-# Verificar módulos instalados
-Get-Module -ListAvailable | grep ActiveDirectory
-Get-Module -ListAvailable | grep GroupPolicy
-```
-
-### Configuração de PSRemoting
-O script requer **PSRemoting habilitado nos Domain Controllers**.
-
-#### Habilitar em cada DC (como Administrador):
-```powershell
-Enable-PSRemoting -Force -SkipNetworkProfileCheck
-```
-
-#### Ou remotamente (de um DC para todos os outros):
-```powershell
-$DCs = @('SSOOAD01', 'SSOOAD02')  # Altere conforme seus DCs
-$DCs | ForEach-Object {
-    Invoke-Command -ComputerName $_ -ScriptBlock {
-        Enable-PSRemoting -Force -SkipNetworkProfileCheck
-    }
-}
-```
-
-### Conectividade de Rede
-- Portas **5985 (HTTP)** e **5986 (HTTPS)** abertas para WSMan
-- Firewall permitindo PSRemoting entre máquinas
-
-## 🎯 Como Usar
-
-### 1. Executar o Script
-```powershell
-# Como Administrador
-.\AD-Monitor-Blocked-Users.ps1
-```
-
-### 2. Escolher Modo de Monitoramento
-
-O script exibirá um menu:
-```
-╔══════════════════════════════════════════════════╗
-║        MONITOR DE BLOQUEIOS - ACTIVE DIRECTORY   ║
-╠══════════════════════════════════════════════════╣
-║ Selecione o tipo de monitoramento:               ║
-║                                                  ║
-║ 1) Monitorar TODOS os usuários                   ║
-║ 2) Monitorar um USUÁRIO ESPECÍFICO               ║
-║                                                  ║
-║ Pressione 1 ou 2...                              ║
-╚══════════════════════════════════════════════════╝
-```
-
-**Opção 1**: Monitora todos os bloqueios em tempo real
-**Opção 2**: Solicita o nome do usuário e monitora apenas esse
-
-### 3. Interpretar Resultados
-
-Quando um bloqueio é detectado:
-```
-==================================================
- 🚨 BLOQUEIO DETECTADO 
-==================================================
-👤 Usuário:        usuario.silva
-🕒 Data/Hora:      2026-03-05 14:32:15
-💻 Disp. de Origem: PC-MARIA-001
-🌐 IP Resolvido:    192.168.1.150
-🔎 Diagnóstico:    Estação de Trabalho / Dispositivo Padrão
---------------------------------------------------
-```
-
-## 📊 Estrutura do Script
-
-### Funções Principais
-
-#### `Get-MonitoringChoice`
-Exibe menu interativo para seleção do tipo de monitoramento.
-
-**Retorna:**
-```powershell
-@{
-    Tipo = "Todos" | "Especifico"
-    Usuario = $null | "nome.usuario"
-}
-```
-
-#### `Get-SourceAnalysis`
-Analisa a máquina de origem do bloqueio.
-
-**Parâmetros:**
-- `$CallerComputer` - Nome da máquina de origem
-
-**Retorna:**
-```powershell
-@{
-    IP = "IP resolvido" | "Não resolvido"
-    Suspeita = "Diagnóstico da origem"
-}
-```
-
-**Lógica de Diagnóstico:**
-| Pattern | Diagnóstico |
-|---------|-------------|
-| EXCH, MAIL, OWA, WEB | Servidor de E-mail/Web (celular) |
-| DC0, AD0, SRV-AD | Domain Controller |
-| VPN, FW, FIREWALL | Gateway/VPN |
-| FS, FILE, ARQUIVO | File Server |
-| Outros | Estação de Trabalho Padrão |
-
-#### `Format-LockoutEvent`
-Formata e exibe graficamente um evento de bloqueio.
-
-**Parâmetros:**
-- `$evento` - Objeto do evento de bloqueio
-- `$TargetUserName` - Nome do usuário bloqueado
-- `$CallerComputer` - Máquina de origem
-
-#### `Start-ADLockoutMonitor`
-Loop principal de monitoramento em tempo real.
-
-**Funcionalidade:**
-- Executa PSRemoting em todos os DCs a cada 10 segundos
-- Busca eventos ID 4740 (Account Lockout)
-- Processa eventos em paralelo
-- Mantém cache de eventos processados para evitar duplicatas
-
-#### `Test-PSRemotingAvailability`
-Testa conectividade PSRemoting em todos os DCs.
-
-**Retorna:**
-```powershell
-@{
-    Disponivel = $true | $false
-    Detalhes = @(
-        @{ DC = "SSOOAD01"; Status = "OK" | "FALHA"; Erro = $null }
-    )
-}
-```
-
-#### `Show-PSRemotingDiagnostics`
-Executa diagnóstico completo de PSRemoting com 5 verificações:
-1. Status do serviço WinRM local
-2. Conectividade WSMan nos DCs
-3. Configuração de Trusted Hosts
-4. Acessibilidade das portas 5985/5986
-5. Informações do sistema local
-
-#### `Enable-PSRemotingOnDCs`
-Habilita PSRemoting automaticamente em todos os DCs (requer admin).
-
-## 🔧 Solução de Problemas
-
-### Erro: "PSRemoting não está habilitado"
-```
-⚠️ ERRO DE PSRemoting - Detalhes:
-   • Tipo de Erro: WinRMOperationFailure
-   • Mensagem: WinRM não está em execução
-```
-
-**Solução:**
-```powershell
-# Habilitar PSRemoting localmente
-Enable-PSRemoting -Force -SkipNetworkProfileCheck
-
-# Ou usar o script - escolha opção 2 no menu de diagnóstico
-```
-
-### Erro: "Timeout na comunicação com DCs"
-```
-💡 Diagnóstico: Timeout na comunicação com DCs
-```
-
-**Soluções:**
-1. Verificar conectividade: `ping DC-NAME`
-2. Testar porta WSMan: `Test-NetConnection -ComputerName DC-NAME -Port 5985`
-3. Aumentar timeout nos DCs via GPO (WinRM config)
-
-### Erro: "Acesso Negado / Unauthorized"
-```
-💡 Diagnóstico: Erro de autenticação ou permissão
-```
-
-**Soluções:**
-1. Verificar privilégios de Admin: `whoami /groups`
-2. Adicionar DC aos Trusted Hosts: 
-   ```powershell
-   Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force
-   ```
-3. Executar como Administrador do Domínio
-
-### Erro: "Resolução DNS falha"
-```
-💡 Diagnóstico: Erro de resolução DNS ou nome inválido
-```
-
-**Soluções:**
-1. Testar DNS: `nslookup DC-NAME`
-2. Verificar configuração DNS: `Get-DnsClientServerAddress`
-3. Usar FQDN ou IP em vez de NetBIOS
-
-### O script não encontra eventos
-
-**Possíveis causas:**
-- Nenhum bloqueio ocorreu no período de monitoramento
-- Logs de auditoria não habilitados (Event ID 4740)
-- Usuário não tem permissão para ler Security Log
-
-**Verificar auditoria:**
-```powershell
-# Em um DC, verificar Log de Segurança
-Get-WinEvent -FilterHashtable @{ 
-    LogName = 'Security'
-    ID = 4740
-} -MaxEvents 10 | Format-Table TimeCreated, @{N='User';E={$_.Properties[0].Value}}
-```
-
-## 📝 Exemplos de Uso
-
-### Exemplo 1: Monitorar Todos os Bloqueios
-```powershell
-# Executar script
-.\AD-Monitor-Blocked-Users.ps1
-
-# Escolher opção 1
-# Script exibirá todos os bloqueios em tempo real
-```
-
-### Exemplo 2: Monitorar Usuário Específico
-```powershell
-# Executar script
-.\AD-Monitor-Blocked-Users.ps1
-
-# Escolher opção 2
-# Digitar: francisco.silva
-# Script filtrará apenas bloqueios deste usuário
-```
-
-### Exemplo 3: Testar Conectividade antes de Monitorar
-```powershell
-# Obter DCs
-$DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name
-
-# Testar cada DC
-foreach ($dc in $DCs) {
-    Write-Host "Testando $dc..."
-    Test-WSMan -ComputerName $dc -ErrorAction SilentlyContinue
-}
-```
-
-## 🔐 Segurança
-
-### Recomendações
-- ✅ Execute sempre como **Administrador do Domínio**
-- ✅ Configure **firewall** adequadamente
-- ✅ Use **HTTPS para PSRemoting** em produção
-- ✅ Implemente **logging** dos monitoramentos (considere redirecionar output)
-- ✅ Restrinja acesso ao script (permissões de arquivo)
-
-### Dados Coletados
-O script coleta:
-- Nome de usuário
-- Timestamp do bloqueio
-- Nome da máquina de origem
-- IP da máquina (resolvido)
-- Domain Controller de origem
-
-**Estes dados NÃO são armazenados**, apenas exibidos no console.
-
-## 📈 Performance
-
-### Otimizações Implementadas
-- 🔄 **Cache DNS**: Evita resolver mesmo host múltiplas vezes
-- ⚡ **Execução Paralela**: Consulta todos os DCs simultaneamente
-- 🎯 **Filtragem Inteligente**: Apenas busca eventos dos últimos 5 minutos
-- 📦 **HashSet**: Rastreia eventos processados sem duplicatas
-
-### Intervalo de Verificação
-- **10 segundos** entre ciclos de busca
-- Ajustável modificando `Start-Sleep -Seconds 10` no loop
-
-## 🐛 Limitações Conhecidas
-
-1. **Requer PSRemoting**: Não funciona sem acesso remoto aos DCs
-2. **Eventos Locais**: Não monitora ativa contra ataques em DCs específicos
-3. **Cache em Memória**: Limpo ao reiniciar o script
-4. **Timezone**: Usa timezone do servidor onde o script executa
-
-## 📞 Suporte e Diagnóstico
-
-Para diagnóstico completo, execute:
-```powershell
-# Opção automática no script
-# Escolha a opção de diagnóstico no menu de PSRemoting
-
-# Ou manualmente
-$DCs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name
-Show-PSRemotingDiagnostics -ComputerNames $DCs
-```
-
-## 📄 Licença e Uso
-
-- Script de **código aberto**
-- Use livremente em seu ambiente
-- Customize conforme necessário
-- Teste em ambiente de teste primeiro
+# 🔐 AD Lockout Monitor v2.0
+
+> Monitor de bloqueios de conta do Active Directory em tempo real, com análise de origem, diagnóstico automático e estatísticas de sessão.
+
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue?logo=powershell&logoColor=white)
+![Active Directory](https://img.shields.io/badge/Active%20Directory-required-0078D4?logo=microsoft&logoColor=white)
+![PSRemoting](https://img.shields.io/badge/PSRemoting-WinRM-green)
+![Event ID](https://img.shields.io/badge/Event%20ID-4740-red)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
 
-**Versão:** 2.0  
-**Última Atualização:** Março 2026  
-**Testado em:** Windows Server 2019, 2022 com PowerShell 5.1+
+## 📋 Índice
+
+- [Visão Geral](#-visão-geral)
+- [Funcionalidades](#-funcionalidades)
+- [Pré-requisitos](#-pré-requisitos)
+- [Instalação e Uso](#-instalação-e-uso)
+- [Arquitetura](#-arquitetura)
+- [Referência de Funções](#-referência-de-funções)
+- [Análise de Origem](#-análise-de-origem)
+- [Tratamento de Erros](#-tratamento-de-erros)
+- [Estrutura de Dados](#-estrutura-de-dados)
+- [Segurança](#-segurança)
+- [FAQ](#-faq)
+
+---
+
+## 🔍 Visão Geral
+
+O **AD Lockout Monitor** é um script PowerShell que monitora eventos de bloqueio de conta (Event ID 4740) em todos os Domain Controllers do domínio simultaneamente, via PSRemoting. A cada ciclo de 10 segundos, novos bloqueios são detectados, classificados por origem e exibidos no console com diagnóstico contextualizado.
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║               AD LOCKOUT MONITOR  v2.0                               ║
+║      Active Directory — Monitor de Bloqueios em Tempo Real           ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+  Início                dd/MM/yyyy HH:mm:ss
+  Domain Controllers    DC01  |  DC02  |  DC03
+  Modo de busca         Remoto via PSRemoting
+  Intervalo             10 segundos por ciclo
+
+  Pressione Ctrl+C para encerrar.
+```
+
+---
+
+## ✨ Funcionalidades
+
+| Feature | Detalhe |
+|---|---|
+| ⚡ **Tempo real** | Ciclos de 10 s com polling paralelo em todos os DCs |
+| 🎯 **Filtro por usuário** | Monitora todos ou filtra por uma conta específica |
+| 🔍 **Análise de origem** | Classifica o dispositivo de origem em 5 categorias |
+| 🚦 **Severidade** | Três níveis: Alta (VPN/FW), Média (Exchange/DC), Baixa (Workstation) |
+| ♻️ **Deduplicação** | HashSet por `DC + RecordId` — cada evento processado exatamente uma vez |
+| 📊 **Estatísticas** | Contadores por sessão, por DC, por usuário e janela deslizante de 60 min |
+| 🛡️ **Auto-diagnóstico** | Detecta e categoriza falhas de WinRM com sugestão de correção |
+| 🔧 **Setup automático** | Habilita PSRemoting nos DCs automaticamente se necessário |
+
+---
+
+## 📦 Pré-requisitos
+
+- **PowerShell 5.1** ou superior
+- **Módulo ActiveDirectory** (RSAT — instalado automaticamente se disponível)
+- **Privilégio de Administrador** na máquina de execução
+- **Leitura do log Security** nos Domain Controllers (grupo *Event Log Readers* ou Admin de Domínio)
+- **WinRM habilitado** em todos os DCs (portas **5985** e/ou **5986** acessíveis)
+- **DNS** — resolução de nomes dos DCs a partir da máquina de execução
+
+> [!WARNING]
+> O script verifica automaticamente se está sendo executado como Administrador e encerra caso contrário.
+
+---
+
+## 🚀 Instalação e Uso
+
+### 1. Clone ou baixe o script
+
+```powershell
+git clone https://github.com/seu-usuario/ad-lockout-monitor.git
+cd ad-lockout-monitor
+```
+
+### 2. Execute como Administrador
+
+```powershell
+.\ADLockoutMonitor.ps1
+```
+
+### 3. Selecione o modo de monitoramento
+
+```
+  [1]  Monitorar TODOS os usuários
+  [2]  Monitorar um USUÁRIO ESPECÍFICO
+```
+
+#### Monitorar todos os usuários
+Escolha `[1]` — todos os bloqueios de qualquer conta serão exibidos em tempo real.
+
+#### Monitorar usuário específico
+Escolha `[2]` e informe o `sAMAccountName`:
+
+```
+  Usuário (ex: francisco.silva): joao.silva
+```
+
+> [!NOTE]
+> No modo específico, as estatísticas globais continuam sendo coletadas para todos os usuários — apenas a exibição é filtrada.
+
+### 4. Encerrar
+
+Pressione `Ctrl+C` a qualquer momento. O painel de estatísticas final é exibido automaticamente.
+
+---
+
+## 🏗️ Arquitetura
+
+O script está organizado em **8 regiões** delimitadas por `#region`/`#endregion`:
+
+```
+ADLockoutMonitor.ps1
+│
+├── #region INICIALIZAÇÃO
+│   ├── Import-Module ActiveDirectory
+│   ├── $DCs  ← Get-ADDomainController -Filter *
+│   ├── $cacheDns  ← cache de resolução DNS
+│   └── $script:Stats  ← contadores globais de sessão
+│
+├── #region HELPERS DE INTERFACE
+│   ├── Write-Separator   ← linhas horizontais
+│   ├── Write-Header      ← caixas com borda dupla (╔═╗)
+│   ├── Write-StatusBar   ← linhas com timestamp
+│   ├── Write-KeyValue    ← pares chave–valor em colunas
+│   └── Write-Badge       ← rótulos com fundo colorido
+│
+├── #region ANÁLISE DE ORIGEM
+│   └── Get-SourceAnalysis  ← classifica CallerComputer + resolve DNS
+│
+├── #region FORMATAÇÃO DE EVENTOS
+│   └── Format-LockoutEvent  ← renderiza alerta completo no console
+│
+├── #region PAINEL DE ESTATÍSTICAS
+│   └── Show-StatsPanel  ← resumo acumulado da sessão
+│
+├── #region TELA DE SELEÇÃO
+│   └── Get-MonitoringChoice  ← menu interativo de modo
+│
+├── #region MONITORAMENTO PRINCIPAL
+│   └── Start-ADLockoutMonitor  ← loop principal de polling
+│
+└── #region PRÉ-REQUISITOS / PSREMOTING
+    ├── Test-PSRemotingAvailability
+    ├── Show-PSRemotingDiagnostics
+    ├── Show-PSRemotingInstructions
+    └── Enable-PSRemotingOnDCs
+```
+
+### Fluxo de execução
+
+```
+Início
+  │
+  ├─ [Verificação] Administrador? ──► Não → encerra
+  │
+  ├─ [Teste] Test-PSRemotingAvailability
+  │     └─ Falha? → menu: [1] Diagnóstico  [2] Habilitar  [3] Sair
+  │
+  ├─ [Menu] Get-MonitoringChoice → Todos | Específico
+  │
+  └─ [Loop] Start-ADLockoutMonitor ──────────────────────────────┐
+        │                                                         │
+        ├─ Invoke-Command (paralelo nos DCs) → eventos 4740       │
+        ├─ Deduplica por HashSet                                  │
+        ├─ Filtra por usuário (se modo específico)                │
+        ├─ Atualiza $script:Stats                                 │
+        ├─ Format-LockoutEvent → exibe alerta                     │
+        ├─ ciclo % 30 == 0 → Show-StatsPanel                      │
+        ├─ erro → diagnóstico → failCount++                       │
+        │     └─ failCount >= 3 → break ──────────────────────────┘
+        └─ Start-Sleep 10s → repete
+              │
+              ▼
+        Show-StatsPanel (resumo final)
+```
+
+---
+
+## 📖 Referência de Funções
+
+### `Get-SourceAnalysis`
+
+Classifica o dispositivo de origem (`CallerComputer`) do evento 4740 e resolve seu IP via DNS com cache em memória.
+
+**Parâmetro:**
+
+| Nome | Tipo | Descrição |
+|---|---|---|
+| `-CallerComputer` | `String` | Nome do dispositivo (Properties[3] do evento 4740) |
+
+**Retorno:** `Hashtable` com as chaves `IP`, `Icone`, `Tipo`, `Suspeita`, `Sev`
+
+---
+
+### `Format-LockoutEvent`
+
+Renderiza o alerta completo no console com badge de severidade, campos do evento e diagnóstico.
+
+**Parâmetros:**
+
+| Nome | Tipo | Descrição |
+|---|---|---|
+| `-Evento` | `PSCustomObject` | Objeto retornado pelo `Invoke-Command` remoto |
+| `-TargetUserName` | `String` | Usuário bloqueado — `Properties[0]` |
+| `-CallerComputer` | `String` | Dispositivo de origem — `Properties[3]` |
+| `-DCNome` | `String` | Nome do DC que registrou o evento |
+
+---
+
+### `Show-StatsPanel`
+
+Exibe painel com estatísticas acumuladas. Chamado a cada **30 ciclos** e no encerramento.
+
+Campos exibidos: tempo de execução, ciclos, total de bloqueios, bloqueios na última hora, DCs monitorados, contagem por DC, top 3 usuários.
+
+---
+
+### `Start-ADLockoutMonitor`
+
+Loop principal de monitoramento.
+
+| Parâmetro | Tipo | Descrição |
+|---|---|---|
+| `-MonitoringChoice` | `Hashtable` | Retornado por `Get-MonitoringChoice` (`Tipo` + `Usuario`) |
+
+**Variáveis de configuração internas:**
+
+| Variável | Padrão | Efeito |
+|---|---|---|
+| `$lastChecked` | `Now - 7 dias` | Janela retroativa inicial de coleta |
+| `Start-Sleep` | `10 segundos` | Intervalo entre ciclos |
+| `ciclo % 30` | `30` | Frequência do painel de resumo |
+| `$failureCount` | `3` | Máximo de falhas consecutivas antes de encerrar |
+
+---
+
+### `Test-PSRemotingAvailability`
+
+Executa `Test-WSMan` em cada DC. Retorna `@{ Disponivel=$bool; Detalhes=@(...) }`.
+
+---
+
+### `Show-PSRemotingDiagnostics`
+
+Diagnóstico de conectividade em 5 etapas:
+
+1. Status do serviço WinRM local
+2. Teste WSMan em cada DC
+3. Conteúdo de `WSMan:\localhost\Client\TrustedHosts`
+4. Teste de portas 5985/5986 via `Test-NetConnection`
+5. Versão do SO e do PowerShell
+
+---
+
+### `Enable-PSRemotingOnDCs`
+
+Executa `Enable-PSRemoting -Force -SkipNetworkProfileCheck` via `Invoke-Command` em cada DC.
+
+---
+
+## 🔎 Análise de Origem
+
+O `Get-SourceAnalysis` classifica o `CallerComputer` por regex e atribui severidade:
+
+| Padrão (Regex) | Ícone | Tipo | Severidade | Diagnóstico |
+|---|---|---|---|---|
+| *(vazio / `-`)* | `[?]` | Origem Oculta | 🟡 Média | Celular via ActiveSync, RADIUS/NPS ou mapeamento externo |
+| `EXCH\|MAIL\|OWA\|WEB` | `[M]` | Servidor E-mail/Web | 🟡 Média | Senha desatualizada em dispositivo móvel (ActiveSync) |
+| `DC0\|AD0\|SRV-AD` | `[D]` | Domain Controller | 🟡 Média | Autenticação direta; verificar Wi-Fi (NPS), VPN ou scripts |
+| `VPN\|FW\|FIREWALL` | `[!]` | Gateway / VPN | 🔴 Alta | Conexão externa; possível ataque de força bruta |
+| `FS\|FILE\|ARQUIVO` | `[F]` | File Server | 🟢 Baixa | Mapeamento de rede com credenciais antigas |
+| *(default)* | `[W]` | Estação de Trabalho | 🟢 Baixa | Verificar Gerenciador de Credenciais ou Tarefas Agendadas |
+
+> [!TIP]
+> O cache DNS (`$cacheDns`) armazena `CallerComputer → IP` para evitar chamadas repetidas ao DNS durante a sessão.
+
+---
+
+## ⚠️ Tratamento de Erros
+
+O bloco `catch` do loop principal categoriza automaticamente as exceções de PSRemoting:
+
+| Padrão na mensagem | Diagnóstico | Sugestão |
+|---|---|---|
+| `timeout \| WinRM \| timed out` | Timeout de comunicação | Verificar ping/telnet 5985; aumentar `-OperationTimeoutSec`; checar WinRM |
+| `Access Denied \| Unauthorized` | Credenciais insuficientes | Executar como Admin de Domínio; verificar `TrustedHosts` |
+| `WinRM não está \| not connected` | WinRM desabilitado | `Enable-PSRemoting -Force` no DC; verificar firewall; `Restart-Service WinRM` |
+| `firewall \| port` | Bloqueio de firewall | Liberar portas 5985/5986; `Test-NetConnection -ComputerName DC -Port 5985` |
+| `host \| DNS \| não encontrado` | Falha de DNS | `nslookup` no DC; usar FQDN ou IP; checar `Get-DnsClientServerAddress` |
+| *(default)* | Erro não categorizado | Verificar WinRM e conectividade de rede |
+
+> [!CAUTION]
+> Após **3 falhas consecutivas**, o monitoramento é encerrado automaticamente e o painel de estatísticas final é exibido.
+
+---
+
+## 🗄️ Estrutura de Dados
+
+### `$script:Stats`
+
+Hashtable global de sessão, persistido durante toda a execução:
+
+| Chave | Tipo | Descrição |
+|---|---|---|
+| `TotalBloqueios` | `Int` | Contador acumulado de eventos únicos |
+| `UltimaHora` | `Queue<DateTime>` | Fila para janela deslizante de 60 min |
+| `BloqueiosPorDC` | `Hashtable` | Contagem de bloqueios indexada por nome de DC |
+| `BloqueiosPorUser` | `Hashtable` | Contagem de bloqueios indexada por username |
+| `CicloAtual` | `Int` | Número do ciclo em execução |
+| `Inicio` | `DateTime` | Timestamp de início (base do uptime) |
+
+### `$cacheDns`
+
+`Hashtable` de escopo de script. Armazena `CallerComputer → IP`. Valor é `$null` se a resolução falhar.
+
+### `$processedEvents`
+
+`HashSet<String>` com IDs de eventos já processados no formato `"NomeDC-RecordId"`. Garante que cada evento seja exibido exatamente uma vez entre ciclos.
+
+---
+
+## 🔒 Segurança
+
+> [!WARNING]
+> Execute apenas em ambientes controlados, com credenciais dedicadas de monitoramento. O acesso ao log de Segurança dos DCs é altamente privilegiado.
+
+- **Permissões mínimas:** membro do grupo *Event Log Readers* + permissão de PSRemoting nos DCs
+- **Sem escrita:** o script apenas lê eventos e não modifica nenhum objeto do AD
+- **Cache DNS:** mantido apenas em memória durante a sessão, sem persistência em disco
+- **HashSet de eventos:** cresce ao longo da sessão — em ambientes com alto volume, considere reiniciar o script periodicamente
+- **PSRemoting:** use credenciais com menor privilégio possível; considere *Just Enough Administration (JEA)*
+
+---
+
+## ❓ FAQ
+
+**O script trava na verificação de PSRemoting — o que fazer?**
+
+Execute o diagnóstico completo (`[1]` no menu de PSRemoting) ou verifique manualmente:
+
+```powershell
+# Testar conectividade WinRM
+Test-NetConnection -ComputerName NOME-DO-DC -Port 5985
+
+# Verificar serviço WinRM local
+Get-Service WinRM
+
+# Habilitar PSRemoting em um DC remotamente
+Invoke-Command -ComputerName NOME-DO-DC -ScriptBlock {
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck
+}
+```
+
+---
+
+**Posso executar sem ser Admin de Domínio?**
+
+Sim, com permissões reduzidas: adicione a conta ao grupo *Event Log Readers* nos DCs e configure permissões de PSRemoting para essa conta. O script ainda exigirá privilégio de Administrador local para iniciar.
+
+---
+
+**O script exibe bloqueios retroativos ao iniciar — é normal?**
+
+Sim. A variável `$lastChecked` é inicializada com `Now - 7 dias` para capturar eventos recentes na primeira execução. Após o primeiro ciclo, apenas novos eventos serão processados (deduplicação via HashSet).
+
+---
+
+**Como ajustar o intervalo de polling?**
+
+Localize a linha `Start-Sleep -Seconds 10` dentro da função `Start-ADLockoutMonitor` e altere o valor conforme necessário. Valores abaixo de 5 segundos podem gerar carga excessiva nos DCs.
+
+---
+
+**Como ajustar a frequência do painel de resumo?**
+
+Localize `if ($ciclo % 30 -eq 0)` e altere o divisor. Ex.: `% 10` exibe o painel a cada 10 ciclos (~100 segundos).
+
+---

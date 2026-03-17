@@ -1,5 +1,5 @@
 # ============================================================
-#  AD LOCKOUT MONITOR v2.0
+#  AD LOCKOUT MONITOR v2.1
 #  Requer: PowerShell 5.1+, Módulo ActiveDirectory, Admin
 # ============================================================
 
@@ -22,6 +22,13 @@ $script:Stats = @{
     Inicio          = Get-Date
 }
 foreach ($dc in $DCs) { $script:Stats.BloqueiosPorDC[$dc] = 0 }
+
+# Arquivo de log de erros (opção 3)
+$script:LogFile = if ($PSScriptRoot) {
+    Join-Path $PSScriptRoot 'lockout_errors.log'
+} else {
+    Join-Path $PWD 'lockout_errors.log'
+}
 
 #endregion
 
@@ -80,6 +87,28 @@ function Write-Badge {
     )
     Write-Host " $Text " -ForegroundColor $TextColor -BackgroundColor $BgColor -NoNewline
     Write-Host ''
+}
+
+function Write-ErrorLog {
+    param(
+        [string]$Category,
+        [string]$Message
+    )
+    $ts   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "[$ts] [$Category] $Message"
+
+    # exibe no console
+    Write-Host ''
+    Write-Host '  [LOG] ' -ForegroundColor DarkRed -NoNewline
+    Write-Host $line -ForegroundColor Red
+
+    # grava no arquivo
+    try {
+        Add-Content -Path $script:LogFile -Value $line -Encoding UTF8 -ErrorAction Stop
+        Write-Host '  ' -NoNewline
+        Write-Host "  Gravado em: $script:LogFile" -ForegroundColor DarkGray
+    }
+    catch { <# silencioso — falha no log nunca trava o script #> }
 }
 
 #endregion
@@ -182,8 +211,6 @@ function Show-StatsPanel {
     Write-Host ('├' + ('─' * ($width - 2)) + '┤') -ForegroundColor DarkGray
 
     function StatLine([string]$k, [string]$v, [System.ConsoleColor]$vc) {
-        $line = "│  {0,-24}{1}" -f $k, $v
-        $line = $line.PadRight($width - 1) + '│'
         Write-Host '│  ' -ForegroundColor DarkGray -NoNewline
         Write-Host ('{0,-24}' -f $k) -ForegroundColor DarkGray -NoNewline
         Write-Host ('{0}' -f $v).PadRight($width - 28) -ForegroundColor $vc -NoNewline
@@ -207,7 +234,6 @@ function Show-StatsPanel {
             StatLine "    $dc" $cnt 'Magenta'
         }
 
-        # top usuários
         $topUsers = $script:Stats.BloqueiosPorUser.GetEnumerator() |
                     Sort-Object Value -Descending |
                     Select-Object -First 3
@@ -233,36 +259,344 @@ function Show-StatsPanel {
 
 function Get-MonitoringChoice {
     Clear-Host
-    Write-Header -Title 'AD LOCKOUT MONITOR  v2.0' -Subtitle 'Active Directory — Monitor de Bloqueios em Tempo Real'
+    Write-Header -Title 'AD LOCKOUT MONITOR  v2.1' -Subtitle 'Active Directory — Monitor de Bloqueios em Tempo Real'
 
     Write-Host '  Selecione o tipo de monitoramento:' -ForegroundColor White
     Write-Host ''
     Write-Host '  [1]' -ForegroundColor Yellow -NoNewline
-    Write-Host '  Monitorar TODOS os usuários' -ForegroundColor White
+    Write-Host '  Monitorar TODOS os usuários (tempo real)' -ForegroundColor White
     Write-Host ''
     Write-Host '  [2]' -ForegroundColor Green -NoNewline
-    Write-Host '  Monitorar um USUÁRIO ESPECÍFICO' -ForegroundColor White
+    Write-Host '  Monitorar um USUÁRIO ESPECÍFICO (tempo real)' -ForegroundColor White
+    Write-Host ''
+    Write-Host '  [3]' -ForegroundColor Cyan -NoNewline
+    Write-Host '  Consultar HISTÓRICO de bloqueios' -ForegroundColor White
     Write-Host ''
     Write-Separator
 
     $choice = $null
-    while ($choice -notin @('1','2')) {
+    while ($choice -notin @('1','2','3')) {
         Write-Host '  Opção ' -ForegroundColor DarkGray -NoNewline
         $choice = Read-Host
 
-        if ($choice -eq '2') {
-            Write-Host ''
-            Write-Host '  Usuário (ex: francisco.silva): ' -ForegroundColor DarkGray -NoNewline
-            $usuario = Read-Host
-            return @{ Tipo = 'Especifico'; Usuario = $usuario }
-        }
-        elseif ($choice -eq '1') {
-            return @{ Tipo = 'Todos'; Usuario = $null }
-        }
-        else {
-            Write-Host '  Opção inválida. Digite 1 ou 2.' -ForegroundColor Red
+        switch ($choice) {
+            '2' {
+                Write-Host ''
+                Write-Host '  Usuário (ex: francisco.silva): ' -ForegroundColor DarkGray -NoNewline
+                $usuario = Read-Host
+                return @{ Tipo = 'Especifico'; Usuario = $usuario }
+            }
+            '1' { return @{ Tipo = 'Todos'; Usuario = $null } }
+            '3' { return @{ Tipo = 'Historico'; Usuario = $null } }
+            default { Write-Host '  Opção inválida. Digite 1, 2 ou 3.' -ForegroundColor Red }
         }
     }
+}
+
+#endregion
+
+#region ── CONSULTA HISTÓRICA ───────────────────────────────
+
+function Read-DateInput {
+    param([string]$Prompt, [datetime]$Default)
+
+    Write-Host "  $Prompt " -ForegroundColor DarkGray -NoNewline
+    Write-Host "[$($Default.ToString('dd/MM/yyyy HH:mm'))] " -ForegroundColor DarkGray -NoNewline
+    $input = Read-Host
+
+    if ([string]::IsNullOrWhiteSpace($input)) { return $Default }
+
+    $parsed = $null
+    $formats = @('dd/MM/yyyy HH:mm', 'dd/MM/yyyy', 'MM/dd/yyyy', 'yyyy-MM-dd')
+    foreach ($fmt in $formats) {
+        if ([datetime]::TryParseExact($input.Trim(), $fmt,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+            return $parsed
+        }
+    }
+
+    Write-Host '  Data inválida. Usando valor padrão.' -ForegroundColor Yellow
+    Write-ErrorLog -Category 'DataInvalida' -Message "Entrada '$($input.Trim())' inválida no prompt '$Prompt'. Padrão usado: $($Default.ToString('dd/MM/yyyy HH:mm'))"
+    return $Default
+}
+
+function Show-HistoricalQuery {
+    Clear-Host
+    Write-Header -Title 'AD LOCKOUT MONITOR  v2.1' -Subtitle 'Consulta de Histórico de Bloqueios'
+
+    # ── coleta parâmetros ────────────────────────────────────
+    Write-Host '  Período de consulta' -ForegroundColor White
+    Write-Host '  (Enter para aceitar o valor padrão entre colchetes)' -ForegroundColor DarkGray
+    Write-Host ''
+
+    $defaultInicio = (Get-Date).AddDays(-7).Date
+    $defaultFim    = Get-Date
+
+    $dataInicio = Read-DateInput -Prompt 'Data início (dd/MM/yyyy ou dd/MM/yyyy HH:mm):' -Default $defaultInicio
+    $dataFim    = Read-DateInput -Prompt 'Data fim    (dd/MM/yyyy ou dd/MM/yyyy HH:mm):' -Default $defaultFim
+
+    if ($dataInicio -gt $dataFim) {
+        Write-Host ''
+        Write-Host '  Erro: data início é posterior à data fim.' -ForegroundColor Red
+        Start-Sleep -Seconds 2
+        return
+    }
+
+    Write-Host ''
+    Write-Host '  Filtro de usuário' -ForegroundColor White
+    Write-Host '  Usuário (deixe em branco para todos): ' -ForegroundColor DarkGray -NoNewline
+    $usuarioFiltro = Read-Host
+
+    Write-Host ''
+    Write-Host '  Formato de saída' -ForegroundColor White
+    Write-Host '  [1]' -ForegroundColor Yellow -NoNewline
+    Write-Host ' Detalhado (mesmo layout do tempo real)' -ForegroundColor White
+    Write-Host '  [2]' -ForegroundColor Green -NoNewline
+    Write-Host ' Tabela resumida' -ForegroundColor White
+    Write-Host '  [3]' -ForegroundColor Cyan -NoNewline
+    Write-Host ' Exportar para CSV' -ForegroundColor White
+    Write-Host ''
+    Write-Host '  Formato ' -ForegroundColor DarkGray -NoNewline
+    $formato = Read-Host
+    if ($formato -notin @('1','2','3')) { $formato = '2' }
+
+    $csvPath = $null
+    if ($formato -eq '3') {
+        Write-Host '  Caminho do CSV [.\lockouts_historico.csv]: ' -ForegroundColor DarkGray -NoNewline
+        $csvInput = Read-Host
+        $csvPath  = if ([string]::IsNullOrWhiteSpace($csvInput)) { '.\lockouts_historico.csv' } else { $csvInput }
+    }
+
+    # ── execução ─────────────────────────────────────────────
+    Clear-Host
+    Write-Header -Title 'AD LOCKOUT MONITOR  v2.1' -Subtitle 'Consulta de Histórico de Bloqueios'
+
+    Write-KeyValue -Key 'Período'   -Value "$($dataInicio.ToString('dd/MM/yyyy HH:mm'))  →  $($dataFim.ToString('dd/MM/yyyy HH:mm'))" -ValueColor White
+    Write-KeyValue -Key 'Usuário'   -Value (if ($usuarioFiltro) { $usuarioFiltro } else { '(todos)' }) -ValueColor Cyan
+    Write-KeyValue -Key 'DCs'       -Value ($DCs -join '  |  ') -ValueColor DarkCyan
+    Write-Separator
+    Write-Host ''
+    Write-StatusBar 'Consultando eventos nos DCs...' 'Cyan'
+    Write-Host ''
+
+    $erros = @()
+
+    try {
+        $resultados = Invoke-Command -ComputerName $DCs -ErrorAction Stop -ScriptBlock {
+            param($ini, $fim)
+            try {
+                $evts = Get-WinEvent -FilterHashtable @{
+                    LogName   = 'Security'
+                    ID        = 4740
+                    StartTime = $ini
+                    EndTime   = $fim
+                } -ErrorAction SilentlyContinue
+
+                if ($evts) {
+                    foreach ($e in $evts) {
+                        [PSCustomObject]@{
+                            RecordId       = $e.RecordId
+                            TimeCreated    = $e.TimeCreated
+                            TargetUserName = $e.Properties[0].Value
+                            CallerComputer = $e.Properties[3].Value
+                            OrigemDC       = $env:COMPUTERNAME
+                        }
+                    }
+                }
+            }
+            catch {
+                [PSCustomObject]@{
+                    RecordId       = -1
+                    TimeCreated    = Get-Date
+                    TargetUserName = '__ERRO__'
+                    CallerComputer = $_.Exception.Message
+                    OrigemDC       = $env:COMPUTERNAME
+                }
+            }
+        } -ArgumentList $dataInicio, $dataFim
+    }
+    catch {
+        Write-Host ''
+        Write-Separator -Char '─' -Color DarkRed
+        Write-Host '  Falha ao conectar nos DCs via PSRemoting.' -ForegroundColor Red
+        Write-KeyValue -Key 'Erro' -Value $_.Exception.Message -ValueColor Yellow
+        Write-ErrorLog -Category 'PSRemoting' -Message $_.Exception.Message
+        Write-Separator -Char '─' -Color DarkRed
+        Write-Host ''
+        Read-Host '  Pressione Enter para voltar'
+        return
+    }
+
+    # ── separa erros dos eventos reais ───────────────────────
+    $eventos = @()
+    if ($resultados) {
+        foreach ($r in $resultados) {
+            if ($r.TargetUserName -eq '__ERRO__') {
+                $erros += "  DC $($r.OrigemDC): $($r.CallerComputer)"
+                Write-ErrorLog -Category "DC-$($r.OrigemDC)" -Message $r.CallerComputer
+            } else {
+                $eventos += $r
+            }
+        }
+    }
+
+    # ── aplica filtro de usuário ─────────────────────────────
+    if ($usuarioFiltro) {
+        $eventos = $eventos | Where-Object { $_.TargetUserName -ieq $usuarioFiltro }
+    }
+
+    # ── ordena cronologicamente ──────────────────────────────
+    $eventos = $eventos | Sort-Object TimeCreated
+
+    # ── exibe erros parciais (DCs com falha) ─────────────────
+    if ($erros.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  Avisos — DCs com erro durante a consulta:' -ForegroundColor Yellow
+        $erros | ForEach-Object { Write-Host $_ -ForegroundColor DarkYellow }
+        Write-Host ''
+    }
+
+    # ── sem resultados ───────────────────────────────────────
+    if (-not $eventos -or $eventos.Count -eq 0) {
+        Write-Host ''
+        Write-Separator -Char '─' -Color DarkGray
+        Write-Host '  Nenhum bloqueio encontrado para os critérios informados.' -ForegroundColor DarkGray
+        Write-Separator -Char '─' -Color DarkGray
+        Write-Host ''
+        Read-Host '  Pressione Enter para voltar'
+        return
+    }
+
+    Write-StatusBar "$($eventos.Count) bloqueio(s) encontrado(s)." 'Green'
+    Write-Host ''
+
+    # ── renderiza conforme formato escolhido ─────────────────
+    switch ($formato) {
+
+        '1' {
+            # Detalhado — mesmo layout do tempo real
+            foreach ($ev in $eventos) {
+                Format-LockoutEvent `
+                    -Evento         $ev `
+                    -TargetUserName $ev.TargetUserName `
+                    -CallerComputer $ev.CallerComputer `
+                    -DCNome         $ev.OrigemDC
+            }
+        }
+
+        '2' {
+            # Tabela resumida
+            $larguras = @{ U=20; D=19; O=20; T=8 }
+            $sep = '  {0}  {1}  {2}  {3}' -f
+                ('─' * $larguras.U), ('─' * $larguras.D),
+                ('─' * $larguras.O), ('─' * $larguras.T)
+
+            Write-Host ''
+            Write-Host ('  {0,-20}  {1,-19}  {2,-20}  {3,-8}' -f 'Usuário','Data / Hora','Origem','DC') -ForegroundColor DarkGray
+            Write-Host $sep -ForegroundColor DarkGray
+
+            foreach ($ev in $eventos) {
+                $analysis = Get-SourceAnalysis -CallerComputer $ev.CallerComputer
+                $orig     = if ([string]::IsNullOrWhiteSpace($ev.CallerComputer) -or $ev.CallerComputer -eq '-') {
+                                'Oculto'
+                            } else { $ev.CallerComputer }
+
+                $sevColor = switch ($analysis.Sev) {
+                    'High' { 'Red' }
+                    'Med'  { 'Yellow' }
+                    default{ 'Green' }
+                }
+
+                Write-Host ('  {0,-20}' -f $ev.TargetUserName)                          -ForegroundColor Cyan    -NoNewline
+                Write-Host ('  {0,-19}' -f $ev.TimeCreated.ToString('dd/MM/yy HH:mm:ss')) -ForegroundColor White   -NoNewline
+                Write-Host ('  {0,-20}' -f $orig)                                        -ForegroundColor $sevColor -NoNewline
+                Write-Host ('  {0,-8}'  -f $ev.OrigemDC)                                 -ForegroundColor DarkCyan
+            }
+
+            Write-Host $sep -ForegroundColor DarkGray
+            Write-Host ''
+        }
+
+        '3' {
+            # CSV
+            $csvData = $eventos | Select-Object `
+                @{N='DataHora';      E={ $_.TimeCreated.ToString('dd/MM/yyyy HH:mm:ss') }},
+                @{N='Usuario';       E={ $_.TargetUserName }},
+                @{N='Origem';        E={ $_.CallerComputer }},
+                @{N='DC';            E={ $_.OrigemDC }},
+                @{N='TipoOrigem';    E={ (Get-SourceAnalysis -CallerComputer $_.CallerComputer).Tipo }},
+                @{N='Severidade';    E={ (Get-SourceAnalysis -CallerComputer $_.CallerComputer).Sev }},
+                @{N='Diagnostico';   E={ (Get-SourceAnalysis -CallerComputer $_.CallerComputer).Suspeita }}
+
+            try {
+                $csvData | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -Force
+                Write-Host ''
+                Write-Host '  Arquivo exportado com sucesso:' -ForegroundColor Green
+                Write-KeyValue -Key 'Caminho'   -Value (Resolve-Path $csvPath).Path   -ValueColor White
+                Write-KeyValue -Key 'Registros' -Value $csvData.Count                 -ValueColor Cyan
+            }
+            catch {
+                Write-Host ''
+                Write-Host "  Erro ao exportar CSV: $($_.Exception.Message)" -ForegroundColor Red
+                Write-ErrorLog -Category 'CSV-Export' -Message $_.Exception.Message
+            }
+            Write-Host ''
+        }
+    }
+
+    # ── resumo do histórico ──────────────────────────────────
+    if ($formato -ne '3') {
+        $width = 72
+        Write-Host ('┌' + ('─' * ($width - 2)) + '┐') -ForegroundColor DarkCyan
+
+        $title = ' RESUMO DA CONSULTA '
+        $pad   = [math]::Floor(($width - 2 - $title.Length) / 2)
+        Write-Host ('│' + (' ' * $pad) + $title + (' ' * ($width - 2 - $pad - $title.Length)) + '│') -ForegroundColor DarkCyan
+        Write-Host ('├' + ('─' * ($width - 2)) + '┤') -ForegroundColor DarkGray
+
+        function HistStatLine([string]$k, [string]$v, [System.ConsoleColor]$vc) {
+            Write-Host '│  ' -ForegroundColor DarkGray -NoNewline
+            Write-Host ('{0,-28}' -f $k) -ForegroundColor DarkGray -NoNewline
+            Write-Host ('{0}' -f $v).PadRight($width - 32) -ForegroundColor $vc -NoNewline
+            Write-Host '│' -ForegroundColor DarkGray
+        }
+
+        $totalEvt   = $eventos.Count
+        $totalUsers = ($eventos | Select-Object -ExpandProperty TargetUserName -Unique).Count
+        $periodo    = "$($dataInicio.ToString('dd/MM/yy HH:mm')) → $($dataFim.ToString('dd/MM/yy HH:mm'))"
+
+        HistStatLine 'Período consultado:'    $periodo         'White'
+        HistStatLine 'Total de bloqueios:'    $totalEvt        'Red'
+        HistStatLine 'Usuários afetados:'     $totalUsers      'Yellow'
+
+        # por DC
+        Write-Host ('├' + ('─' * ($width - 2)) + '┤') -ForegroundColor DarkGray
+        Write-Host '│  Por DC:' -ForegroundColor DarkGray -NoNewline
+        Write-Host (' ' * ($width - 11)) -NoNewline
+        Write-Host '│' -ForegroundColor DarkGray
+
+        $eventos | Group-Object OrigemDC | Sort-Object Count -Descending | ForEach-Object {
+            HistStatLine "    $($_.Name)" $_.Count 'Magenta'
+        }
+
+        # top usuários
+        $topH = $eventos | Group-Object TargetUserName | Sort-Object Count -Descending | Select-Object -First 5
+        if ($topH) {
+            Write-Host ('├' + ('─' * ($width - 2)) + '┤') -ForegroundColor DarkGray
+            Write-Host '│  Top usuários bloqueados:' -ForegroundColor DarkGray -NoNewline
+            Write-Host (' ' * ($width - 28)) -NoNewline
+            Write-Host '│' -ForegroundColor DarkGray
+            foreach ($u in $topH) {
+                HistStatLine "    $($u.Name)" "$($u.Count)x" 'Yellow'
+            }
+        }
+
+        Write-Host ('└' + ('─' * ($width - 2)) + '┘') -ForegroundColor DarkCyan
+        Write-Host ''
+    }
+
+    Read-Host '  Pressione Enter para voltar ao menu'
 }
 
 #endregion
@@ -279,15 +613,15 @@ function Start-ADLockoutMonitor {
     $failureCount       = 0
 
     Clear-Host
-    Write-Header -Title 'AD LOCKOUT MONITOR  v2.0' -Subtitle $(
+    Write-Header -Title 'AD LOCKOUT MONITOR  v2.1' -Subtitle $(
         if ($MonitorEspecifico) { "Monitorando: $UsuarioAlvo" } else { 'Monitorando todos os usuários' }
     )
 
-    Write-KeyValue -Key 'Início'          -Value (Get-Date -Format 'dd/MM/yyyy HH:mm:ss') -ValueColor White
-    Write-KeyValue -Key 'Domain Controllers' -Value ($DCs -join '  |  ')                  -ValueColor Cyan
-    Write-KeyValue -Key 'Modo de busca'   -Value 'Remoto via PSRemoting'                  -ValueColor DarkCyan
-    Write-KeyValue -Key 'Paralelismo'     -Value 'Todos os DCs simultaneamente'           -ValueColor DarkCyan
-    Write-KeyValue -Key 'Intervalo'       -Value '10 segundos por ciclo'                  -ValueColor DarkGray
+    Write-KeyValue -Key 'Início'             -Value (Get-Date -Format 'dd/MM/yyyy HH:mm:ss') -ValueColor White
+    Write-KeyValue -Key 'Domain Controllers' -Value ($DCs -join '  |  ')                     -ValueColor Cyan
+    Write-KeyValue -Key 'Modo de busca'      -Value 'Remoto via PSRemoting'                  -ValueColor DarkCyan
+    Write-KeyValue -Key 'Paralelismo'        -Value 'Todos os DCs simultaneamente'           -ValueColor DarkCyan
+    Write-KeyValue -Key 'Intervalo'          -Value '10 segundos por ciclo'                  -ValueColor DarkGray
     Write-Host ''
     Write-Host '  Pressione ' -ForegroundColor DarkGray -NoNewline
     Write-Host 'Ctrl+C' -ForegroundColor Yellow -NoNewline
@@ -335,14 +669,13 @@ function Start-ADLockoutMonitor {
                     $uid = "$($evento.OrigemDC)-$($evento.RecordId)"
                     if (-not $processedEvents.Add($uid)) { continue }
 
-                    $userName      = $evento.TargetUserName
-                    $callerComp    = $evento.CallerComputer
-                    $dcNome        = $evento.OrigemDC
+                    $userName   = $evento.TargetUserName
+                    $callerComp = $evento.CallerComputer
+                    $dcNome     = $evento.OrigemDC
 
                     $deveExibir = -not $MonitorEspecifico -or ($userName -ieq $UsuarioAlvo)
                     if (-not $deveExibir) { continue }
 
-                    # Atualiza estatísticas
                     $script:Stats.TotalBloqueios++
                     $script:Stats.UltimaHora.Enqueue((Get-Date))
                     $script:Stats.BloqueiosPorDC[$dcNome]++
@@ -363,7 +696,6 @@ function Start-ADLockoutMonitor {
                 Write-Host ' OK' -ForegroundColor DarkGreen
             }
 
-            # Painel de resumo a cada 30 ciclos
             if ($ciclo % 30 -eq 0) { Show-StatsPanel }
         }
         catch {
@@ -378,9 +710,9 @@ function Start-ADLockoutMonitor {
             Write-Separator -Char '─' -Color DarkRed
             Write-Host '  ERRO DE PSREMOTING' -ForegroundColor Red
             Write-Separator -Char '─' -Color DarkRed
-            Write-KeyValue -Key 'Tipo'     -Value $type           -ValueColor Yellow
-            Write-KeyValue -Key 'Linha PS' -Value $line           -ValueColor Yellow
-            Write-KeyValue -Key 'Mensagem' -Value $msg            -ValueColor Red
+            Write-KeyValue -Key 'Tipo'     -Value $type -ValueColor Yellow
+            Write-KeyValue -Key 'Linha PS' -Value $line -ValueColor Yellow
+            Write-KeyValue -Key 'Mensagem' -Value $msg  -ValueColor Red
 
             $diagnostico = switch -Regex ($msg) {
                 'timeout|WinRM|timed out|TimeoutException' {
@@ -420,7 +752,6 @@ function Start-ADLockoutMonitor {
         Start-Sleep -Seconds 10
     }
 
-    # Exibe resumo final ao sair
     Write-Host ''
     Write-Separator -Char '═' -Color Cyan
     Write-Host '  SESSÃO ENCERRADA' -ForegroundColor Cyan
@@ -447,17 +778,16 @@ function Test-PSRemotingAvailability {
         }
         catch {
             $msg  = $_.Exception.Message
-            $code = $_.Exception.HResult
             $type = $_.Exception.GetType().Name
             Write-Host " — FALHA ($type)" -ForegroundColor Red
             Write-Host "      $msg" -ForegroundColor DarkRed
 
             $causa = switch -Regex ($msg) {
-                'timeout|timed out|WinRM'               { 'Timeout ou WinRM desabilitado' }
-                'Access Denied|Unauthorized'            { 'Credenciais insuficientes' }
-                'not found|não resolvido|resolver'      { 'Nome inválido ou DNS' }
-                'firewall|porta|port'                   { 'Firewall bloqueando 5985/5986' }
-                default                                 { 'Causa indeterminada' }
+                'timeout|timed out|WinRM'          { 'Timeout ou WinRM desabilitado' }
+                'Access Denied|Unauthorized'       { 'Credenciais insuficientes' }
+                'not found|não resolvido|resolver' { 'Nome inválido ou DNS' }
+                'firewall|porta|port'              { 'Firewall bloqueando 5985/5986' }
+                default                            { 'Causa indeterminada' }
             }
             Write-Host "      Causa provável: $causa" -ForegroundColor DarkYellow
 
@@ -601,8 +931,15 @@ try {
         } while ($opcao -notin @('2','3'))
     }
 
-    $choice = Get-MonitoringChoice
-    Start-ADLockoutMonitor -MonitoringChoice $choice
+    # ── loop do menu principal ────────────────────────────────
+    do {
+        $choice = Get-MonitoringChoice
+
+        switch ($choice.Tipo) {
+            'Historico' { Show-HistoricalQuery }
+            default     { Start-ADLockoutMonitor -MonitoringChoice $choice }
+        }
+    } while ($choice.Tipo -eq 'Historico')   # tempo real encerra o script ao sair
 }
 catch {
     Write-Host ''
